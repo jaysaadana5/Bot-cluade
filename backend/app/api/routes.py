@@ -189,12 +189,57 @@ async def get_snapshots(limit: int = 100, db: AsyncSession = Depends(get_db)):
     }
 
 
+# ── Trading Mode ──────────────────────────────────────────────────────
+
+@router.get("/trading-mode")
+async def get_trading_mode():
+    if bot_runner is None:
+        return {"mode": "paper", "message": "Bot not initialized"}
+    return {
+        "mode": bot_runner.engine.trading_mode,
+        "paper_summary": bot_runner.engine.paper_engine.get_summary() if bot_runner.engine.trading_mode == "paper" else None,
+    }
+
+
+@router.post("/trading-mode/{mode}")
+async def set_trading_mode(mode: str):
+    if bot_runner is None:
+        raise HTTPException(500, "Bot not initialized")
+    if mode not in ("paper", "live"):
+        raise HTTPException(400, "Mode must be 'paper' or 'live'")
+    if mode == "live" and not bot_runner.engine.polymarket.api_key:
+        raise HTTPException(400, "Cannot switch to live mode without Polymarket API key configured")
+    bot_runner.engine.set_trading_mode(mode)
+    return {
+        "status": "ok",
+        "mode": mode,
+        "message": f"Trading mode switched to {mode.upper()}",
+    }
+
+
+# ── Risk / Regime Stats ─────────────────────────────────────────────
+
+@router.get("/risk-stats")
+async def get_risk_stats():
+    if bot_runner is None:
+        raise HTTPException(500, "Bot not initialized")
+    return {
+        "risk": bot_runner.engine.risk_manager.get_stats(),
+        "regime_config": {
+            "threshold": bot_runner.engine.trading_config.threshold,
+            "max_loss_streak": bot_runner.engine.trading_config.max_loss_streak,
+            "cooldown_hours": bot_runner.engine.trading_config.cooldown_hours,
+        },
+    }
+
+
 # ── Settings ──────────────────────────────────────────────────────────
 
 @router.get("/settings")
 async def get_settings():
     from ..core.config import settings
     return {
+        "trading_mode": bot_runner.engine.trading_mode if bot_runner else settings.trading_mode,
         "interval_seconds": settings.bot_interval_seconds,
         "max_position_size": settings.max_position_size,
         "risk_per_trade": settings.risk_per_trade,
@@ -202,6 +247,7 @@ async def get_settings():
         "take_profit_pct": settings.take_profit_pct,
         "has_polymarket_key": bool(settings.polymarket_api_key),
         "has_x_token": bool(settings.x_bearer_token),
+        "paper_starting_balance": settings.paper_starting_balance,
     }
 
 

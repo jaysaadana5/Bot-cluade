@@ -15,11 +15,13 @@ class Settings(BaseSettings):
     x_api_secret: str = ""
 
     # Trading
+    trading_mode: str = "paper"  # "paper" or "live"
     bot_interval_seconds: int = 300
     max_position_size: float = 100.0
     risk_per_trade: float = 0.02
     stop_loss_pct: float = 0.05
     take_profit_pct: float = 0.10
+    paper_starting_balance: float = 10000.0
 
     # Database
     database_url: str = "sqlite:///./data/trading_bot.db"

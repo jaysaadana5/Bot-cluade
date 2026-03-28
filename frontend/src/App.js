@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useMemo } from 'react';
 import { usePolling } from './hooks/usePolling';
 import * as api from './services/api';
 
@@ -66,6 +66,12 @@ function App() {
   }, [refetchStatus, refetchPortfolio]);
 
   const isRunning = botStatus?.is_running || false;
+  const tradingMode = botStatus?.trading_mode || settingsData?.trading_mode || 'paper';
+
+  const handleModeChange = useCallback(async (mode) => {
+    await api.setTradingMode(mode);
+    await refetchStatus();
+  }, [refetchStatus]);
 
   const tabs = [
     { id: 'dashboard', label: 'Dashboard' },
@@ -93,6 +99,18 @@ function App() {
           </div>
         </div>
         <div className="header-right">
+          <div style={{
+            padding: '0.25rem 0.75rem',
+            borderRadius: '6px',
+            fontSize: '0.75rem',
+            fontWeight: 700,
+            letterSpacing: '0.05em',
+            background: tradingMode === 'paper' ? 'rgba(234, 179, 8, 0.15)' : 'rgba(239, 68, 68, 0.15)',
+            color: tradingMode === 'paper' ? '#eab308' : '#ef4444',
+            border: `1px solid ${tradingMode === 'paper' ? 'rgba(234, 179, 8, 0.3)' : 'rgba(239, 68, 68, 0.3)'}`,
+          }}>
+            {tradingMode === 'paper' ? 'PAPER' : 'LIVE'}
+          </div>
           <div className={`status-badge ${isRunning ? 'running' : 'stopped'}`}>
             <div className={`status-dot ${isRunning ? 'running' : 'stopped'}`} />
             {isRunning ? 'Running' : 'Stopped'}
@@ -125,7 +143,7 @@ function App() {
 
             <div className="grid grid-2">
               <SentimentPanel sentiment={sentiment} history={sentimentHistory?.history || []} />
-              <SettingsPanel settings={settingsData} />
+              <SettingsPanel settings={settingsData} tradingMode={tradingMode} onModeChange={handleModeChange} />
             </div>
 
             <TradesTable trades={tradesData?.trades || []} />
@@ -151,7 +169,7 @@ function App() {
         {activeTab === 'settings' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
             <div className="grid grid-2">
-              <SettingsPanel settings={settingsData} />
+              <SettingsPanel settings={settingsData} tradingMode={tradingMode} onModeChange={handleModeChange} />
               <div className="card">
                 <div className="card-header">
                   <span className="card-title">Bot Status</span>

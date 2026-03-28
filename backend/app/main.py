@@ -13,6 +13,7 @@ from .core.config import settings
 from .core.database import init_db
 from .services.polymarket_client import PolymarketClient
 from .services.x_sentiment import XSentimentAnalyzer
+from .services.btc_price_feed import BTCPriceFeed
 from .services.trading_engine import TradingEngine
 from .services.bot_runner import BotRunner
 from .api.routes import router, set_dependencies
@@ -31,13 +32,14 @@ logger = logging.getLogger(__name__)
 # Global instances
 polymarket_client = None
 sentiment_analyzer = None
+price_feed = None
 trading_engine = None
 bot_runner_instance = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global polymarket_client, sentiment_analyzer, trading_engine, bot_runner_instance
+    global polymarket_client, sentiment_analyzer, price_feed, trading_engine, bot_runner_instance
 
     logger.info("Starting Polymarket BTC Trading Bot...")
 
@@ -52,13 +54,15 @@ async def lifespan(app: FastAPI):
         funder=settings.polymarket_funder,
     )
     sentiment_analyzer = XSentimentAnalyzer(bearer_token=settings.x_bearer_token)
-    trading_engine = TradingEngine(polymarket_client, sentiment_analyzer)
+    price_feed = BTCPriceFeed()
+    trading_engine = TradingEngine(polymarket_client, sentiment_analyzer, price_feed)
     bot_runner_instance = BotRunner(trading_engine)
 
     # Wire up API routes
     set_dependencies(bot_runner_instance, polymarket_client, sentiment_analyzer)
 
     logger.info("All services initialized")
+    logger.info(f"Trading Mode: {settings.trading_mode.upper()}")
     logger.info(f"Polymarket API: {'configured' if settings.polymarket_api_key else 'PAPER TRADING MODE'}")
     logger.info(f"X Sentiment: {'configured' if settings.x_bearer_token else 'disabled (no token)'}")
 
@@ -70,6 +74,7 @@ async def lifespan(app: FastAPI):
         bot_runner_instance.stop()
     await polymarket_client.close()
     await sentiment_analyzer.close()
+    await price_feed.close()
 
 
 app = FastAPI(

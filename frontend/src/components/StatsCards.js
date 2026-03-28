@@ -23,7 +23,9 @@ function StatsCards({ portfolio, botStatus, sentiment }) {
     {
       label: 'Bot Cycles',
       value: botStatus?.cycle_count || 0,
-      change: botStatus?.is_running ? 'Active' : 'Stopped',
+      change: botStatus?.trading_mode === 'paper'
+        ? `Paper | Bal: $${botStatus?.paper_summary?.balance?.toFixed(0) || '--'}`
+        : botStatus?.is_running ? 'Live Active' : 'Stopped',
       changeClass: botStatus?.is_running ? 'positive' : 'negative',
     },
   ];

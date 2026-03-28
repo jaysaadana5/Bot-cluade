@@ -36,6 +36,11 @@ export const getTrades = (limit = 50, offset = 0) =>
 export const getSnapshots = (limit = 100) =>
   api.get('/snapshots', { params: { limit } });
 
+// Trading Mode
+export const getTradingMode = () => api.get('/trading-mode');
+export const setTradingMode = (mode) => api.post(`/trading-mode/${mode}`);
+export const getRiskStats = () => api.get('/risk-stats');
+
 // Settings
 export const getSettings = () => api.get('/settings');
 

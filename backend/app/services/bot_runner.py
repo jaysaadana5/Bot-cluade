@@ -81,9 +81,12 @@ class BotRunner:
     def get_status(self) -> dict:
         return {
             "is_running": self.is_running,
+            "trading_mode": self.engine.trading_mode,
             "cycle_count": self.cycle_count,
             "interval_seconds": settings.bot_interval_seconds,
             "last_result": self.last_result,
             "last_signal": self.engine.last_signal,
             "selected_market": self.engine.selected_market,
+            "risk_stats": self.engine.risk_manager.get_stats(),
+            "paper_summary": self.engine.paper_engine.get_summary() if self.engine.trading_mode == "paper" else None,
         }
