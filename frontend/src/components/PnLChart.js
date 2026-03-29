@@ -1,6 +1,6 @@
 import React, { useMemo } from 'react';
 import {
-  LineChart, Line, AreaChart, Area, XAxis, YAxis, Tooltip,
+  AreaChart, Area, XAxis, YAxis, Tooltip,
   ResponsiveContainer, CartesianGrid,
 } from 'recharts';
 

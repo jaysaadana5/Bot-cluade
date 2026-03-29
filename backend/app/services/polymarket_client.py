@@ -2,6 +2,7 @@
 Polymarket API Client - interfaces with Polymarket's CLOB API
 for BTC-related prediction markets.
 """
+import json
 import httpx
 import logging
 from typing import Optional
@@ -227,7 +228,6 @@ class PolymarketClient:
         outcome_prices = m.get("outcomePrices", "")
         if outcome_prices and isinstance(outcome_prices, str):
             try:
-                import json
                 prices = json.loads(outcome_prices)
                 if len(prices) >= 2:
                     yes_price = float(prices[0])
