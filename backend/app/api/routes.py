@@ -30,8 +30,8 @@ def set_dependencies(runner, poly_client, sentiment):
 async def start_bot():
     if bot_runner is None:
         raise HTTPException(500, "Bot not initialized")
-    bot_runner.start()
-    return {"status": "started", "message": "Trading bot started"}
+    await bot_runner.start()
+    return {"status": "started", "message": "Trading bot started - first cycle running now"}
 
 
 @router.post("/bot/stop")

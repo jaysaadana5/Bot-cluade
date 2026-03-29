@@ -1,6 +1,7 @@
 """
 Bot Runner - manages the 5-minute trading loop using APScheduler.
 """
+import asyncio
 import logging
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -19,34 +20,56 @@ class BotRunner:
         self.is_running = False
         self.last_result = None
         self.cycle_count = 0
-        self.history = []  # Keep last 50 cycle results
+        self.history = []
 
     async def _run_cycle(self):
         """Internal cycle runner."""
         self.cycle_count += 1
         logger.info(f"=== Trading Cycle #{self.cycle_count} @ {datetime.utcnow().isoformat()} ===")
 
-        async with async_session() as db:
-            result = await self.engine.run_cycle(db)
-            self.last_result = result
-            self.history.append(result)
-            if len(self.history) > 50:
-                self.history = self.history[-50:]
+        try:
+            async with async_session() as db:
+                result = await self.engine.run_cycle(db)
+                self.last_result = result
+                self.history.append(result)
+                if len(self.history) > 50:
+                    self.history = self.history[-50:]
 
-            if result.get("trade"):
-                logger.info(f"Trade executed: {result['trade']}")
-            else:
-                logger.info(f"No trade this cycle. Signal: {result.get('signal', {}).get('direction', 'N/A')}")
+                if result.get("trade"):
+                    logger.info(f"Trade executed: {result['trade']}")
+                else:
+                    signal = result.get("signal") or {}
+                    logger.info(
+                        f"No trade this cycle. Status: {result.get('status', 'N/A')}, "
+                        f"Signal: {signal.get('direction', 'N/A')}"
+                    )
+        except Exception as e:
+            logger.error(f"Cycle error: {e}", exc_info=True)
+            self.last_result = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "status": "error",
+                "errors": [str(e)],
+            }
 
-        return result
+        return self.last_result
 
-    def start(self):
-        """Start the bot scheduler."""
+    async def start(self):
+        """Start the bot scheduler and run first cycle immediately."""
         if self.is_running:
             logger.warning("Bot is already running")
             return
 
+        self.is_running = True
+        self.engine.is_running = True
+
+        # Run first cycle immediately in background
+        asyncio.create_task(self._run_cycle())
+
+        # Then schedule repeating cycles
         interval = settings.bot_interval_seconds
+        if not self.scheduler.running:
+            self.scheduler.start()
+
         self.scheduler.add_job(
             self._run_cycle,
             "interval",
@@ -55,10 +78,7 @@ class BotRunner:
             replace_existing=True,
             max_instances=1,
         )
-        self.scheduler.start()
-        self.is_running = True
-        self.engine.is_running = True
-        logger.info(f"Bot started - running every {interval}s")
+        logger.info(f"Bot started - first cycle running now, then every {interval}s")
 
     def stop(self):
         """Stop the bot scheduler."""
@@ -66,7 +86,10 @@ class BotRunner:
             logger.warning("Bot is not running")
             return
 
-        self.scheduler.remove_job("trading_cycle")
+        try:
+            self.scheduler.remove_job("trading_cycle")
+        except Exception:
+            pass
         if self.scheduler.running:
             self.scheduler.shutdown(wait=False)
             self.scheduler = AsyncIOScheduler()
