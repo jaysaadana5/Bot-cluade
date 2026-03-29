@@ -19,13 +19,17 @@ from .services.bot_runner import BotRunner
 from .api.routes import router, set_dependencies
 
 # Configure logging
+log_handlers = [logging.StreamHandler()]
+try:
+    os.makedirs("data", exist_ok=True)
+    log_handlers.append(logging.FileHandler("data/bot.log", mode="a"))
+except Exception:
+    pass  # Skip file logging if directory not writable
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("bot.log", mode="a"),
-    ],
+    handlers=log_handlers,
 )
 logger = logging.getLogger(__name__)
 
