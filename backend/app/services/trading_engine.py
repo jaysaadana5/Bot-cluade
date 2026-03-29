@@ -144,6 +144,7 @@ class TradingEngine:
             "timestamp": cycle_start.isoformat(),
             "status": "completed",
             "trading_mode": self.trading_mode,
+            "synthetic_market": False,
             "markets_scanned": 0,
             "regime": None,
             "signal": None,
@@ -161,20 +162,7 @@ class TradingEngine:
                 )
                 return result
 
-            # 1. Fetch BTC markets from Polymarket
-            markets = await self.polymarket.get_btc_markets()
-            result["markets_scanned"] = len(markets)
-
-            if not markets:
-                result["status"] = "no_markets"
-                result["errors"].append("No active BTC markets found")
-                return result
-
-            market = self._select_best_market(markets)
-            self.selected_market = market
-            logger.info(f"Selected market: {market['question']}")
-
-            # 2. Get BTC spot price data from TradingView
+            # 1. Get BTC spot price data from TradingView FIRST (always works)
             tv_data = await self.price_feed.get_tradingview_analysis(interval="5")
             candles = await self.price_feed.get_5m_candles(limit=50)
             spot_prices = self.price_feed.extract_prices(candles) if candles else []
@@ -183,14 +171,45 @@ class TradingEngine:
             if not spot_prices and tv_data.get("price"):
                 spot_prices = [tv_data["price"]] * 30
 
-            # 3. Get Polymarket price data
-            token_id = market.get("yes_token")
-            poly_history = await self.polymarket.get_price_history(token_id) if token_id else []
-            poly_prices = [float(p.get("p", p.get("price", 0.5))) for p in poly_history if p]
+            current_btc_price = spot_prices[-1] if spot_prices else tv_data.get("price", 0)
 
-            if len(poly_prices) < 5:
-                midpoint = await self.polymarket.get_midpoint(token_id) if token_id else None
-                poly_prices = [midpoint or market.get("yes_price", 0.5)] * 30
+            # 2. Fetch BTC markets from Polymarket
+            markets = await self.polymarket.get_btc_markets()
+            result["markets_scanned"] = len(markets)
+
+            # In paper mode, create a synthetic market if none found
+            use_synthetic = False
+            if not markets and self.trading_mode == "paper" and current_btc_price > 0:
+                use_synthetic = True
+                markets = [self._create_synthetic_market(current_btc_price)]
+                logger.info(f"Paper mode: using synthetic BTC market (BTC=${current_btc_price:.0f})")
+
+            if not markets:
+                result["status"] = "no_markets"
+                result["errors"].append("No active BTC markets found")
+                return result
+
+            result["synthetic_market"] = use_synthetic
+            market = self._select_best_market(markets)
+            self.selected_market = market
+            logger.info(f"Selected market: {market['question']}")
+
+            # 3. Get Polymarket price data (or generate synthetic from BTC price)
+            token_id = market.get("yes_token")
+            poly_prices = []
+
+            if not use_synthetic and token_id:
+                poly_history = await self.polymarket.get_price_history(token_id)
+                poly_prices = [float(p.get("p", p.get("price", 0.5))) for p in poly_history if p]
+
+                if len(poly_prices) < 5:
+                    midpoint = await self.polymarket.get_midpoint(token_id)
+                    poly_prices = [midpoint or market.get("yes_price", 0.5)] * 30
+
+            if len(poly_prices) < 5 and spot_prices:
+                # Derive synthetic odds from BTC price movement
+                poly_prices = self._derive_synthetic_odds(spot_prices)
+                logger.info(f"Using synthetic odds derived from BTC price ({len(poly_prices)} points)")
 
             # 4. Detect market regime
             regime = detect_regime(spot_prices) if len(spot_prices) >= 20 else {
@@ -233,8 +252,10 @@ class TradingEngine:
             )
             db.add(sent_log)
 
-            # 9. Order book pressure
-            orderbook = await self.polymarket.get_orderbook(token_id) if token_id else {}
+            # 9. Order book pressure (skip API for synthetic markets)
+            orderbook = {}
+            if token_id and not use_synthetic:
+                orderbook = await self.polymarket.get_orderbook(token_id)
             book_data = {"buy_pressure": 0.5}
             if orderbook.get("bids") and orderbook.get("asks"):
                 bid_vol = sum(float(b.get("size", 0)) for b in orderbook["bids"][:10])
@@ -281,7 +302,7 @@ class TradingEngine:
             db.add(snapshot)
 
             # 11. Execute trade if confident enough
-            min_confidence = 0.25
+            min_confidence = 0.15 if self.trading_mode == "paper" else 0.25
             if combined["direction"] != "HOLD" and combined.get("confidence", 0) > min_confidence:
                 trade_result = await self._execute_trade(db, market, combined, regime)
                 result["trade"] = trade_result
@@ -295,10 +316,11 @@ class TradingEngine:
             if self.auto_tuner.can_tune() and self.auto_tuner.should_tune(self.risk_manager.pnl_history):
                 self.auto_tuner.adjust_threshold(increase=True)
 
-            # 13. Paper position exit checks
-            if self.trading_mode == "paper" and current_price > 0:
+            # 13. Paper position exit checks (use odds price for exits)
+            exit_check_price = market.get("yes_price", 0.5)
+            if self.trading_mode == "paper" and exit_check_price > 0:
                 exits = self.paper_engine.check_exits(
-                    current_price,
+                    exit_check_price,
                     stop_loss=settings.stop_loss_pct,
                     take_profit=settings.take_profit_pct,
                 )
@@ -389,6 +411,55 @@ class TradingEngine:
             "regime": regime["regime"],
             "confidence": confidence,
         }
+
+    @staticmethod
+    def _create_synthetic_market(btc_price: float) -> dict:
+        """Create a synthetic BTC market for paper trading when Polymarket has none."""
+        # Simulate a "Will BTC be above $X at end of hour?" market
+        # yes_price derived from how close BTC is to a round number target
+        round_target = round(btc_price / 1000) * 1000
+        distance_pct = (btc_price - round_target) / round_target
+        yes_price = max(0.10, min(0.90, 0.50 + distance_pct * 5))
+
+        return {
+            "id": f"synthetic_btc_{int(btc_price)}",
+            "question": f"Will BTC be above ${round_target:,.0f} at end of hour?",
+            "description": f"Synthetic paper-trading market. BTC spot: ${btc_price:,.2f}",
+            "yes_token": f"syn_yes_{int(btc_price)}",
+            "no_token": f"syn_no_{int(btc_price)}",
+            "yes_price": round(yes_price, 4),
+            "no_price": round(1 - yes_price, 4),
+            "volume": 100000,
+            "liquidity": 50000,
+            "end_date": "",
+            "active": True,
+            "closed": False,
+        }
+
+    @staticmethod
+    def _derive_synthetic_odds(spot_prices: list[float]) -> list[float]:
+        """
+        Convert BTC spot prices into synthetic Polymarket-style odds (0-1).
+        Maps price position within recent range to a probability.
+        """
+        if len(spot_prices) < 5:
+            return [0.5] * 30
+
+        min_p = min(spot_prices)
+        max_p = max(spot_prices)
+        price_range = max_p - min_p
+
+        if price_range == 0:
+            return [0.5] * len(spot_prices)
+
+        # Normalize prices to 0.20-0.80 range (typical odds range)
+        odds = []
+        for p in spot_prices:
+            normalized = (p - min_p) / price_range  # 0 to 1
+            odd = 0.20 + normalized * 0.60  # 0.20 to 0.80
+            odds.append(round(odd, 4))
+
+        return odds
 
     def _select_best_market(self, markets: list[dict]) -> dict:
         scored = []

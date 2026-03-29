@@ -29,32 +29,41 @@ class PolymarketClient:
 
     async def get_btc_markets(self) -> list[dict]:
         """Fetch active BTC-related prediction markets from Gamma API."""
-        try:
-            resp = await self.client.get(
-                f"{GAMMA_API_BASE}/markets",
-                params={
-                    "tag": "crypto",
-                    "active": "true",
-                    "closed": "false",
-                    "limit": 50,
-                },
-            )
-            resp.raise_for_status()
-            markets = resp.json()
+        btc_markets = []
+        btc_keywords = ["btc", "bitcoin", "₿"]
 
-            btc_markets = []
-            btc_keywords = ["btc", "bitcoin", "₿"]
-            for m in markets:
-                question = (m.get("question", "") or "").lower()
-                desc = (m.get("description", "") or "").lower()
-                if any(kw in question or kw in desc for kw in btc_keywords):
-                    btc_markets.append(self._normalize_market(m))
+        # Try multiple search strategies
+        search_params = [
+            {"tag": "crypto", "active": "true", "closed": "false", "limit": 100},
+            {"active": "true", "closed": "false", "limit": 100, "tag": "bitcoin"},
+            {"active": "true", "closed": "false", "limit": 200},
+        ]
 
-            logger.info(f"Found {len(btc_markets)} BTC markets")
-            return btc_markets
-        except Exception as e:
-            logger.error(f"Error fetching BTC markets: {e}")
-            return []
+        for params in search_params:
+            try:
+                resp = await self.client.get(f"{GAMMA_API_BASE}/markets", params=params)
+                resp.raise_for_status()
+                markets = resp.json()
+                logger.info(f"Gamma API returned {len(markets)} markets for params={params}")
+
+                for m in markets:
+                    question = (m.get("question", "") or "").lower()
+                    desc = (m.get("description", "") or "").lower()
+                    mid = m.get("id") or m.get("condition_id", "")
+                    if any(kw in question or kw in desc for kw in btc_keywords):
+                        # Avoid duplicates
+                        if not any(existing["id"] == mid for existing in btc_markets):
+                            btc_markets.append(self._normalize_market(m))
+
+                if btc_markets:
+                    break  # Found markets, no need for more searches
+
+            except Exception as e:
+                logger.error(f"Error fetching markets with params {params}: {e}")
+                continue
+
+        logger.info(f"Found {len(btc_markets)} BTC markets total")
+        return btc_markets
 
     async def get_market(self, condition_id: str) -> Optional[dict]:
         """Get a single market by condition ID."""
