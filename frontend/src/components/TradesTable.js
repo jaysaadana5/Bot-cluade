@@ -52,7 +52,7 @@ function TradesTable({ trades = [] }) {
                   ${(trade.pnl || 0).toFixed(2)}
                 </td>
                 <td>
-                  <span className={`status-badge ${trade.status === 'filled' || trade.status === 'paper_trade' ? 'running' : 'stopped'}`}
+                  <span className={`status-badge ${['filled', 'paper_trade', 'paper_filled'].includes(trade.status) ? 'running' : 'stopped'}`}
                         style={{ display: 'inline-flex', fontSize: '0.7rem', padding: '0.15rem 0.5rem' }}>
                     {trade.status}
                   </span>
