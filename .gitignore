@@ -34,3 +34,6 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Sensitive scripts (contain private keys)
+scripts/generate_api_keys.py
