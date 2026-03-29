@@ -386,3 +386,8 @@ tr:hover td {
   .header { flex-wrap: wrap; gap: 0.5rem; }
   .nav-tabs { width: 100%; overflow-x: auto; }
 }
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
