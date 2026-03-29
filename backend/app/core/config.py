@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     polymarket_secret: str = ""
     polymarket_passphrase: str = ""
     polymarket_funder: str = ""
+    polymarket_private_key: str = ""
 
     # X (Twitter)
     x_bearer_token: str = ""

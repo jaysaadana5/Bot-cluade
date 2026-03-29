@@ -207,8 +207,8 @@ async def set_trading_mode(mode: str):
         raise HTTPException(500, "Bot not initialized")
     if mode not in ("paper", "live"):
         raise HTTPException(400, "Mode must be 'paper' or 'live'")
-    if mode == "live" and not bot_runner.engine.polymarket.api_key:
-        raise HTTPException(400, "Cannot switch to live mode without Polymarket API key configured")
+    if mode == "live" and not bot_runner.engine.polymarket.is_live_ready:
+        raise HTTPException(400, "Cannot switch to live mode - Polymarket API not fully configured. Generate API keys first.")
     bot_runner.engine.set_trading_mode(mode)
     return {
         "status": "ok",
@@ -246,6 +246,9 @@ async def get_settings():
         "stop_loss_pct": settings.stop_loss_pct,
         "take_profit_pct": settings.take_profit_pct,
         "has_polymarket_key": bool(settings.polymarket_api_key),
+        "has_private_key": bool(settings.polymarket_private_key),
+        "polymarket_live_ready": polymarket_client.is_live_ready if polymarket_client else False,
+        "polymarket_funder": settings.polymarket_funder or "",
         "has_x_token": bool(settings.x_bearer_token),
         "paper_starting_balance": settings.paper_starting_balance,
     }
@@ -256,3 +259,83 @@ async def get_bot_history():
     if bot_runner is None:
         return {"history": []}
     return {"history": bot_runner.history[-20:]}
+
+
+# ── Polymarket API Management ────────────────────────────────────────
+
+@router.get("/polymarket/status")
+async def polymarket_status():
+    """Get Polymarket API connection status."""
+    if polymarket_client is None:
+        return {"status": "not_initialized", "live_ready": False}
+    return {
+        "status": "connected" if polymarket_client.is_live_ready else "paper_only",
+        "live_ready": polymarket_client.is_live_ready,
+        "has_api_key": bool(polymarket_client.api_key),
+        "has_private_key": bool(polymarket_client.private_key),
+        "funder": polymarket_client.funder or "",
+    }
+
+
+@router.post("/polymarket/derive-credentials")
+async def derive_credentials():
+    """
+    Generate Polymarket API credentials from the configured private key.
+    The private key must be set in the .env file as POLYMARKET_PRIVATE_KEY.
+    """
+    if polymarket_client is None:
+        raise HTTPException(500, "Polymarket client not initialized")
+    if not polymarket_client.private_key:
+        raise HTTPException(400, "No private key configured. Set POLYMARKET_PRIVATE_KEY in .env")
+
+    result = await polymarket_client.derive_api_credentials()
+    if "error" in result:
+        raise HTTPException(500, result["error"])
+
+    # Return credentials (user can save to .env)
+    return {
+        "status": "ok",
+        "message": "API credentials generated. Add these to your .env file for persistence.",
+        "credentials": {
+            "POLYMARKET_API_KEY": result["api_key"],
+            "POLYMARKET_SECRET": result["api_secret"],
+            "POLYMARKET_PASSPHRASE": result["api_passphrase"],
+        },
+        "live_ready": polymarket_client.is_live_ready,
+    }
+
+
+@router.get("/polymarket/balance")
+async def get_polymarket_balance():
+    """Get USDC balance on Polymarket."""
+    if polymarket_client is None:
+        raise HTTPException(500, "Polymarket client not initialized")
+    return await polymarket_client.get_balance()
+
+
+@router.get("/polymarket/positions")
+async def get_polymarket_positions():
+    """Get current Polymarket positions."""
+    if polymarket_client is None:
+        raise HTTPException(500, "Polymarket client not initialized")
+    positions = await polymarket_client.get_positions()
+    return {"positions": positions}
+
+
+@router.get("/polymarket/open-orders")
+async def get_open_orders():
+    """Get open orders on Polymarket."""
+    if polymarket_client is None:
+        raise HTTPException(500, "Polymarket client not initialized")
+    orders = await polymarket_client.get_open_orders()
+    return {"orders": orders}
+
+
+@router.post("/polymarket/cancel-all")
+async def cancel_all_orders():
+    """Cancel all open Polymarket orders."""
+    if polymarket_client is None:
+        raise HTTPException(500, "Polymarket client not initialized")
+    if not polymarket_client.is_live_ready:
+        raise HTTPException(400, "Not in live mode - no orders to cancel")
+    return await polymarket_client.cancel_all_orders()

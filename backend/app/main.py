@@ -56,6 +56,7 @@ async def lifespan(app: FastAPI):
         secret=settings.polymarket_secret,
         passphrase=settings.polymarket_passphrase,
         funder=settings.polymarket_funder,
+        private_key=settings.polymarket_private_key,
     )
     sentiment_analyzer = XSentimentAnalyzer(bearer_token=settings.x_bearer_token)
     price_feed = BTCPriceFeed()
@@ -67,7 +68,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("All services initialized")
     logger.info(f"Trading Mode: {settings.trading_mode.upper()}")
-    logger.info(f"Polymarket API: {'configured' if settings.polymarket_api_key else 'PAPER TRADING MODE'}")
+    logger.info(f"Polymarket API: {'LIVE READY' if polymarket_client.is_live_ready else 'configured (key only)' if settings.polymarket_private_key else 'PAPER MODE'}")
     logger.info(f"X Sentiment: {'configured' if settings.x_bearer_token else 'disabled (no token)'}")
 
     yield

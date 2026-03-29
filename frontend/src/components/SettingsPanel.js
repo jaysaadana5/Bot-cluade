@@ -1,8 +1,18 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import { getPolymarketStatus, derivePolymarketCredentials, getPolymarketBalance } from '../services/api';
 
-function SettingsPanel({ settings, tradingMode, onModeChange }) {
+function SettingsPanel({ settings, tradingMode, onModeChange, onNotify }) {
   const [switching, setSwitching] = useState(false);
   const [confirmLive, setConfirmLive] = useState(false);
+  const [polyStatus, setPolyStatus] = useState(null);
+  const [polyBalance, setPolyBalance] = useState(null);
+  const [generating, setGenerating] = useState(false);
+  const [generatedCreds, setGeneratedCreds] = useState(null);
+
+  useEffect(() => {
+    getPolymarketStatus().then(r => setPolyStatus(r.data)).catch(() => {});
+    getPolymarketBalance().then(r => setPolyBalance(r.data)).catch(() => {});
+  }, []);
 
   const handleModeToggle = async () => {
     const newMode = tradingMode === 'paper' ? 'live' : 'paper';
@@ -20,9 +30,27 @@ function SettingsPanel({ settings, tradingMode, onModeChange }) {
       }
     } catch (err) {
       console.error('Failed to switch mode:', err);
-      alert(err?.response?.data?.detail || 'Failed to switch trading mode');
+      const msg = err?.response?.data?.detail || 'Failed to switch trading mode';
+      if (onNotify) onNotify(msg, 'error');
+      else alert(msg);
     }
     setSwitching(false);
+  };
+
+  const handleGenerateKeys = async () => {
+    setGenerating(true);
+    try {
+      const resp = await derivePolymarketCredentials();
+      setGeneratedCreds(resp.data.credentials);
+      if (onNotify) onNotify('API credentials generated! Restart backend to persist.', 'success');
+      // Refresh status
+      getPolymarketStatus().then(r => setPolyStatus(r.data)).catch(() => {});
+    } catch (err) {
+      const msg = err?.response?.data?.detail || 'Failed to generate credentials';
+      if (onNotify) onNotify(msg, 'error');
+      else alert(msg);
+    }
+    setGenerating(false);
   };
 
   const cancelLiveSwitch = () => setConfirmLive(false);
@@ -39,6 +67,7 @@ function SettingsPanel({ settings, tradingMode, onModeChange }) {
   }
 
   const isPaper = tradingMode === 'paper';
+  const liveReady = polyStatus?.live_ready || settings.polymarket_live_ready;
 
   const items = [
     { label: 'Trading Interval', value: `${settings.interval_seconds}s (${(settings.interval_seconds / 60).toFixed(0)} min)` },
@@ -46,7 +75,6 @@ function SettingsPanel({ settings, tradingMode, onModeChange }) {
     { label: 'Risk Per Trade', value: `${(settings.risk_per_trade * 100).toFixed(1)}%` },
     { label: 'Stop Loss', value: `${(settings.stop_loss_pct * 100).toFixed(1)}%` },
     { label: 'Take Profit', value: `${(settings.take_profit_pct * 100).toFixed(1)}%` },
-    { label: 'Polymarket API', value: settings.has_polymarket_key ? 'Connected' : 'Not Set', status: settings.has_polymarket_key },
     { label: 'X Sentiment', value: settings.has_x_token ? 'Connected' : 'Disabled', status: settings.has_x_token },
   ];
 
@@ -54,6 +82,103 @@ function SettingsPanel({ settings, tradingMode, onModeChange }) {
     <div className="card">
       <div className="card-header">
         <span className="card-title">Configuration</span>
+      </div>
+
+      {/* Polymarket API Status */}
+      <div style={{
+        padding: '1rem',
+        marginBottom: '1rem',
+        background: liveReady
+          ? 'rgba(34, 197, 94, 0.1)'
+          : polyStatus?.has_private_key || settings.has_private_key
+            ? 'rgba(234, 179, 8, 0.1)'
+            : 'rgba(239, 68, 68, 0.1)',
+        border: `1px solid ${liveReady
+          ? 'rgba(34, 197, 94, 0.3)'
+          : polyStatus?.has_private_key || settings.has_private_key
+            ? 'rgba(234, 179, 8, 0.3)'
+            : 'rgba(239, 68, 68, 0.3)'}`,
+        borderRadius: '10px',
+      }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+          <div>
+            <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              Polymarket API
+            </div>
+            <div style={{
+              fontSize: '1.1rem',
+              fontWeight: 700,
+              color: liveReady ? 'var(--green)' : 'var(--yellow)',
+              marginTop: '0.25rem',
+            }}>
+              {liveReady ? 'LIVE READY' : settings.has_polymarket_key ? 'API KEY SET' : polyStatus?.has_private_key || settings.has_private_key ? 'PRIVATE KEY SET' : 'NOT CONFIGURED'}
+            </div>
+          </div>
+
+          {(polyStatus?.has_private_key || settings.has_private_key) && !liveReady && (
+            <button
+              onClick={handleGenerateKeys}
+              disabled={generating}
+              style={{
+                padding: '0.5rem 1rem',
+                borderRadius: '8px',
+                border: 'none',
+                fontWeight: 600,
+                fontSize: '0.8rem',
+                cursor: generating ? 'not-allowed' : 'pointer',
+                background: 'var(--blue)',
+                color: '#fff',
+                opacity: generating ? 0.6 : 1,
+              }}
+            >
+              {generating ? 'Generating...' : 'Generate API Keys'}
+            </button>
+          )}
+        </div>
+
+        {/* Status details */}
+        <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+          {liveReady
+            ? 'Connected to Polymarket CLOB. Ready for live trading.'
+            : polyStatus?.has_private_key || settings.has_private_key
+              ? 'Private key configured. Click "Generate API Keys" to create trading credentials.'
+              : 'Set POLYMARKET_PRIVATE_KEY in .env to enable live trading.'}
+        </div>
+
+        {settings.polymarket_funder && (
+          <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem', fontFamily: 'monospace' }}>
+            Wallet: {settings.polymarket_funder.slice(0, 6)}...{settings.polymarket_funder.slice(-4)}
+          </div>
+        )}
+
+        {polyBalance && polyBalance.balance > 0 && (
+          <div style={{ fontSize: '0.85rem', color: 'var(--green)', marginTop: '0.25rem', fontWeight: 600 }}>
+            Balance: ${parseFloat(polyBalance.balance).toFixed(2)} USDC
+          </div>
+        )}
+
+        {/* Generated credentials display */}
+        {generatedCreds && (
+          <div style={{
+            marginTop: '0.75rem',
+            padding: '0.75rem',
+            background: 'var(--bg-primary)',
+            borderRadius: '8px',
+            fontSize: '0.75rem',
+          }}>
+            <div style={{ fontWeight: 700, marginBottom: '0.5rem', color: 'var(--green)' }}>
+              Credentials Generated - Add to .env:
+            </div>
+            {Object.entries(generatedCreds).map(([key, val]) => (
+              <div key={key} style={{ fontFamily: 'monospace', color: 'var(--text-secondary)', marginBottom: '0.2rem' }}>
+                {key}={val}
+              </div>
+            ))}
+            <div style={{ color: 'var(--yellow)', marginTop: '0.5rem', fontSize: '0.7rem' }}>
+              Restart backend after updating .env to persist credentials.
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Trading Mode Toggle */}
@@ -186,7 +311,7 @@ function SettingsPanel({ settings, tradingMode, onModeChange }) {
       </div>
 
       <div style={{ marginTop: '1rem', padding: '0.75rem', background: 'var(--bg-primary)', borderRadius: '8px', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-        Configure settings via <code>.env</code> file on your VPS. Restart the backend after changes.
+        Configure settings via <code>.env</code> file. Restart the backend after changes.
       </div>
     </div>
   );

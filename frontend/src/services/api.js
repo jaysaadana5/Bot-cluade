@@ -41,6 +41,14 @@ export const getTradingMode = () => api.get('/trading-mode');
 export const setTradingMode = (mode) => api.post(`/trading-mode/${mode}`);
 export const getRiskStats = () => api.get('/risk-stats');
 
+// Polymarket API
+export const getPolymarketStatus = () => api.get('/polymarket/status');
+export const derivePolymarketCredentials = () => api.post('/polymarket/derive-credentials');
+export const getPolymarketBalance = () => api.get('/polymarket/balance');
+export const getPolymarketPositions = () => api.get('/polymarket/positions');
+export const getOpenOrders = () => api.get('/polymarket/open-orders');
+export const cancelAllOrders = () => api.post('/polymarket/cancel-all');
+
 // Settings
 export const getSettings = () => api.get('/settings');
 

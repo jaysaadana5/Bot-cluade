@@ -216,7 +216,7 @@ function App() {
 
             <div className="grid grid-2">
               <SentimentPanel sentiment={sentiment} history={sentimentHistory?.history || []} />
-              <SettingsPanel settings={settingsData} tradingMode={tradingMode} onModeChange={handleModeChange} />
+              <SettingsPanel settings={settingsData} tradingMode={tradingMode} onModeChange={handleModeChange} onNotify={showNotification} />
             </div>
 
             <TradesTable trades={tradesData?.trades || []} />
@@ -242,7 +242,7 @@ function App() {
         {activeTab === 'settings' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
             <div className="grid grid-2">
-              <SettingsPanel settings={settingsData} tradingMode={tradingMode} onModeChange={handleModeChange} />
+              <SettingsPanel settings={settingsData} tradingMode={tradingMode} onModeChange={handleModeChange} onNotify={showNotification} />
               <div className="card">
                 <div className="card-header">
                   <span className="card-title">Bot Status</span>
