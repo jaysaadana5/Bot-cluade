@@ -213,24 +213,11 @@ class TradingEngine:
 
             logger.info(f"[PAPER] BTC=${current_btc_price:.2f}, candles={len(candles)}")
 
-            # 3. Create synthetic market (always works in paper mode)
-            use_synthetic = True
-            markets = []
-            try:
-                markets = await self.polymarket.get_btc_markets()
-            except Exception:
-                pass
-
-            result["markets_scanned"] = len(markets)
-
-            if not markets:
-                markets = [self._create_synthetic_market(current_btc_price)]
-            else:
-                use_synthetic = False
-
-            result["synthetic_market"] = use_synthetic
-            market = self._select_best_market(markets)
+            # 3. Paper mode: ALWAYS use BTC 5min UP/DOWN market (no Polymarket search)
+            market = self._create_synthetic_market(current_btc_price)
             self.selected_market = market
+            result["synthetic_market"] = True
+            result["markets_scanned"] = 0
 
             # 4. Poly prices (synthetic from spot data)
             poly_prices = self._derive_synthetic_odds(spot_prices) if spot_prices else [0.5] * 30
