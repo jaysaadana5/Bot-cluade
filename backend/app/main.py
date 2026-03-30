@@ -22,7 +22,11 @@ from .api.routes import router, set_dependencies
 log_handlers = [logging.StreamHandler()]
 try:
     os.makedirs("data", exist_ok=True)
-    log_handlers.append(logging.FileHandler("data/bot.log", mode="a"))
+    log_path = os.path.join("data", "bot.log")
+    # Remove if it's accidentally a directory
+    if os.path.isdir(log_path):
+        os.rmdir(log_path)
+    log_handlers.append(logging.FileHandler(log_path, mode="a"))
 except Exception:
     pass  # Skip file logging if directory not writable
 
