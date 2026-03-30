@@ -290,46 +290,97 @@ class TradingEngine:
                 book_pressure=book_pressure,
             )
 
-            # 11. Paper mode: Use REGIME + TradingView recommendation as primary signal
-            #     This ensures the bot actually places trades for testing
+            # 11. Paper mode: multi-source signal cascade
+            #     Uses TradingView's pre-computed indicators as primary source
+            #     (these ALWAYS work, unlike locally computed TA from candles)
             trade_direction = None
             trade_confidence = 0
             trade_reasons = list(combined.get("reasons", []))
 
-            # First check: combined TA signal (if strong enough)
+            # Get TradingView's pre-computed values (always available)
+            tv_rec = tv_data.get("recommend_all", 0) or 0
+            tv_rsi = tv_data.get("rsi", 50) or 50
+            tv_macd = tv_data.get("macd", 0) or 0
+            tv_macd_signal = tv_data.get("macd_signal", 0) or 0
+            tv_rec_ma = tv_data.get("recommend_ma", 0) or 0
+            tv_rec_osc = tv_data.get("recommend_oscillators", 0) or 0
+            tv_momentum = tv_data.get("momentum", 0) or 0
+            tv_stoch_k = tv_data.get("stoch_k", 50) or 50
+
+            logger.info(
+                f"[PAPER] TV signals: rec={tv_rec:.3f}, RSI={tv_rsi:.1f}, "
+                f"MACD={tv_macd:.2f}, StochK={tv_stoch_k:.1f}, mom={tv_momentum:.2f}"
+            )
+
+            # Signal 1: Combined TA (if candle data was good enough)
             if combined["direction"] != "HOLD" and combined.get("confidence", 0) > 0.10:
                 trade_direction = combined["direction"]
                 trade_confidence = combined["confidence"]
+                trade_reasons.append("[COMBINED-TA] Multi-indicator agreement")
 
-            # Second check: regime decision (lower threshold in paper)
-            elif regime_decision["action"] == "TRADE":
-                trade_direction = regime_decision["direction"]
-                trade_confidence = regime_decision["confidence"] * 0.7
-                trade_reasons.append(f"[PAPER-REGIME] {regime_decision['reason']}")
-
-            # Third check: TradingView's own recommendation
-            elif tv_data.get("recommend_all") is not None:
-                tv_rec = tv_data["recommend_all"]
-                if tv_rec > 0.2:
+            # Signal 2: TradingView's overall recommendation (MOST RELIABLE)
+            if not trade_direction and abs(tv_rec) > 0.1:
+                if tv_rec > 0.1:
                     trade_direction = "BUY"
-                    trade_confidence = min(abs(tv_rec), 0.8)
-                    trade_reasons.append(f"[TV-SIGNAL] TradingView says BUY (rec={tv_rec:.3f})")
-                elif tv_rec < -0.2:
+                    trade_confidence = min(0.3 + abs(tv_rec) * 0.5, 0.85)
+                    trade_reasons.append(
+                        f"[TV-REC] TradingView: {tv_data.get('recommendation', '?')} "
+                        f"(all={tv_rec:.3f}, MA={tv_rec_ma:.3f}, osc={tv_rec_osc:.3f})"
+                    )
+                else:
                     trade_direction = "SELL"
-                    trade_confidence = min(abs(tv_rec), 0.8)
-                    trade_reasons.append(f"[TV-SIGNAL] TradingView says SELL (rec={tv_rec:.3f})")
+                    trade_confidence = min(0.3 + abs(tv_rec) * 0.5, 0.85)
+                    trade_reasons.append(
+                        f"[TV-REC] TradingView: {tv_data.get('recommendation', '?')} "
+                        f"(all={tv_rec:.3f}, MA={tv_rec_ma:.3f}, osc={tv_rec_osc:.3f})"
+                    )
 
-            # Fourth check: pure RSI-based trade (paper mode only)
-            elif spot_signal.get("indicators", {}).get("rsi") is not None:
-                rsi = spot_signal["indicators"]["rsi"]
-                if rsi < 40:
+            # Signal 3: TradingView RSI extremes
+            if not trade_direction:
+                if tv_rsi < 35:
                     trade_direction = "BUY"
-                    trade_confidence = 0.3 + (40 - rsi) / 100
-                    trade_reasons.append(f"[PAPER-RSI] RSI oversold ({rsi:.1f}) → BUY")
-                elif rsi > 60:
+                    trade_confidence = 0.35 + (35 - tv_rsi) / 70
+                    trade_reasons.append(f"[TV-RSI] Oversold RSI={tv_rsi:.1f} → BUY")
+                elif tv_rsi > 65:
                     trade_direction = "SELL"
-                    trade_confidence = 0.3 + (rsi - 60) / 100
-                    trade_reasons.append(f"[PAPER-RSI] RSI overbought ({rsi:.1f}) → SELL")
+                    trade_confidence = 0.35 + (tv_rsi - 65) / 70
+                    trade_reasons.append(f"[TV-RSI] Overbought RSI={tv_rsi:.1f} → SELL")
+
+            # Signal 4: MACD crossover from TradingView
+            if not trade_direction:
+                macd_diff = tv_macd - tv_macd_signal
+                if abs(macd_diff) > 10:
+                    trade_direction = "BUY" if macd_diff > 0 else "SELL"
+                    trade_confidence = min(0.3 + abs(macd_diff) / 200, 0.7)
+                    trade_reasons.append(
+                        f"[TV-MACD] {'Bullish' if macd_diff > 0 else 'Bearish'} "
+                        f"MACD={tv_macd:.1f} vs Signal={tv_macd_signal:.1f}"
+                    )
+
+            # Signal 5: Stochastic + Momentum combo
+            if not trade_direction:
+                if tv_stoch_k < 25 and tv_momentum > 0:
+                    trade_direction = "BUY"
+                    trade_confidence = 0.3
+                    trade_reasons.append(
+                        f"[TV-STOCH] Oversold StochK={tv_stoch_k:.0f} + positive mom → BUY"
+                    )
+                elif tv_stoch_k > 75 and tv_momentum < 0:
+                    trade_direction = "SELL"
+                    trade_confidence = 0.3
+                    trade_reasons.append(
+                        f"[TV-STOCH] Overbought StochK={tv_stoch_k:.0f} + negative mom → SELL"
+                    )
+
+            # Signal 6: Sentiment-driven (last resort)
+            if not trade_direction and abs(sentiment_result.get("score", 0)) > 0.3:
+                sent = sentiment_result["score"]
+                trade_direction = "BUY" if sent > 0 else "SELL"
+                trade_confidence = min(0.25 + abs(sent) * 0.3, 0.5)
+                trade_reasons.append(
+                    f"[SENTIMENT] {'Bullish' if sent > 0 else 'Bearish'} "
+                    f"news score={sent:.3f} → {trade_direction}"
+                )
 
             # Build the final signal for display
             combined["reasons"] = trade_reasons

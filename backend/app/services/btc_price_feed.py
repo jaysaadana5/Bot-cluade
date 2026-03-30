@@ -1,13 +1,11 @@
 """
-BTC Price Feed via TradingView Scanner API.
+BTC Price Feed via TradingView Scanner API + Binance public klines.
 
-Uses TradingView's public technical analysis scanner to get:
-- Real-time BTC price data (OHLCV)
-- Pre-computed indicators (RSI, MACD, BB, EMA, SMA, etc.)
-- TradingView's own BUY/SELL/NEUTRAL recommendations
-- 5-minute interval data
+Two data sources:
+1. TradingView Scanner: Real-time indicators (RSI, MACD, BB, EMA, recommendations)
+2. Binance Public API: 5-minute OHLCV candle history (no API key needed)
 
-This is the exact same data you see on TradingView charts.
+This gives the bot both pre-computed indicators AND raw price data for custom TA.
 """
 import httpx
 import logging
@@ -17,6 +15,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 TV_SCANNER_URL = "https://scanner.tradingview.com/crypto/scan"
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 
 # Columns we request from TradingView's scanner
 TV_COLUMNS_REALTIME = [
@@ -88,7 +87,6 @@ class BTCPriceFeed:
             # Map column names to values
             raw = {}
             for name, val in zip(col_names, values):
-                # Strip interval suffix for cleaner keys
                 clean = name.replace("|5", "").replace("|15", "").replace("|60", "")
                 raw[clean] = val
 
@@ -119,7 +117,6 @@ class BTCPriceFeed:
         """
         analyses = {}
         for interval in ["5", "15", "60"]:
-            # Use the same columns but with different interval suffixes
             suffix = f"|{interval}" if interval != "1D" else ""
             columns = [f"{col}{suffix}" if suffix else col for col in TV_COLUMNS_REALTIME]
 
@@ -146,7 +143,6 @@ class BTCPriceFeed:
             except Exception as e:
                 logger.error(f"TradingView {interval}m fetch error: {e}")
 
-        # Compute multi-timeframe consensus
         recs = [a.get("recommend_all", 0) for a in analyses.values() if a.get("recommend_all") is not None]
         if recs:
             avg_rec = sum(recs) / len(recs)
@@ -173,51 +169,45 @@ class BTCPriceFeed:
 
     async def get_5m_candles(self, limit: int = 100) -> list[dict]:
         """
-        Fetch BTC 5m candle history from TradingView's charting backend.
-        Falls back to the scanner snapshot if history isn't available.
+        Fetch BTC 5m candle history from Binance public API.
+        No API key needed - completely free.
         """
-        # TradingView's public charting data endpoint
+        # Primary: Binance public klines endpoint
         try:
-            # Use TradingView's UDF (Universal Data Feed) compatible endpoint
-            now_ts = int(datetime.utcnow().timestamp())
-            from_ts = now_ts - (limit * 5 * 60)  # limit * 5 minutes
-
             resp = await self.client.get(
-                "https://tvc4.forexpros.com/a]08e1bd5ff8a191be0c4e0349a5/1/1/8/history",
+                BINANCE_KLINES_URL,
                 params={
-                    "symbol": "1057391",  # BTC/USD on Investing/TV
-                    "resolution": "5",
-                    "from": from_ts,
-                    "to": now_ts,
-                },
-                headers={
-                    "Origin": "https://www.tradingview.com",
-                    "Referer": "https://www.tradingview.com/",
+                    "symbol": "BTCUSDT",
+                    "interval": "5m",
+                    "limit": min(limit, 500),
                 },
             )
             resp.raise_for_status()
             data = resp.json()
 
-            if data.get("s") == "ok" and data.get("c"):
-                candles = []
-                for i in range(len(data["c"])):
-                    candles.append({
-                        "timestamp": data["t"][i] * 1000,
-                        "time_str": datetime.utcfromtimestamp(data["t"][i]).isoformat(),
-                        "open": float(data["o"][i]),
-                        "high": float(data["h"][i]),
-                        "low": float(data["l"][i]),
-                        "close": float(data["c"][i]),
-                        "volume": float(data["v"][i]) if data.get("v") else 0,
-                    })
-                self.last_candles = candles
-                logger.info(f"TradingView: fetched {len(candles)} 5m candles")
-                return candles
-        except Exception as e:
-            logger.warning(f"TradingView candle history unavailable ({e}), using scanner data")
+            candles = []
+            for k in data:
+                candles.append({
+                    "timestamp": int(k[0]),
+                    "time_str": datetime.utcfromtimestamp(k[0] / 1000).isoformat(),
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                    "volume": float(k[5]),
+                })
 
-        # Fallback: build a single-point from scanner data
-        if self.last_5m_data:
+            if candles:
+                self.last_candles = candles
+                logger.info(f"Binance: fetched {len(candles)} 5m candles, "
+                            f"latest=${candles[-1]['close']:.2f}")
+                return candles
+
+        except Exception as e:
+            logger.warning(f"Binance klines failed: {e}")
+
+        # Fallback: build candles from scanner snapshots over time
+        if self.last_5m_data and self.last_5m_data.get("price"):
             d = self.last_5m_data
             candle = {
                 "timestamp": int(datetime.utcnow().timestamp() * 1000),
@@ -229,8 +219,8 @@ class BTCPriceFeed:
                 "volume": d.get("volume", 0),
             }
             self.last_candles.append(candle)
-            # Keep last N candles for rolling TA
             self.last_candles = self.last_candles[-limit:]
+            logger.info(f"Scanner fallback: {len(self.last_candles)} candles accumulated")
             return self.last_candles
 
         return self.last_candles
@@ -239,7 +229,6 @@ class BTCPriceFeed:
         """Parse raw TradingView scanner data into a structured dict."""
         price = raw.get("close", 0) or 0
 
-        # TradingView recommendations: -1 (strong sell) to +1 (strong buy)
         rec_all = raw.get("Recommend.All", 0) or 0
         rec_ma = raw.get("Recommend.MA", 0) or 0
         rec_osc = raw.get("Recommend.Other", 0) or 0
