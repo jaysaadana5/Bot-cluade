@@ -79,9 +79,11 @@ class PolymarketClient:
                 logger.info("CLOB client created (private key only, no API creds yet)")
 
         except ImportError:
-            logger.error("py-clob-client not installed. Run: pip install py-clob-client")
+            logger.warning("py-clob-client not installed - paper mode only. Run: pip install py-clob-client")
+            self._clob_client = None
         except Exception as e:
-            logger.error(f"Failed to initialize CLOB client: {e}")
+            logger.warning(f"CLOB client init failed (paper mode still works): {e}")
+            self._clob_client = None
 
     async def derive_api_credentials(self) -> dict:
         """

@@ -23,13 +23,26 @@ class BotRunner:
         self.history = []
 
     async def _run_cycle(self):
-        """Internal cycle runner."""
+        """Internal cycle runner - never raises, always returns a result."""
         self.cycle_count += 1
         logger.info(f"=== Trading Cycle #{self.cycle_count} @ {datetime.utcnow().isoformat()} ===")
 
         try:
             async with async_session() as db:
-                result = await self.engine.run_cycle(db)
+                try:
+                    result = await self.engine.run_cycle(db)
+                except Exception as inner_e:
+                    logger.error(f"Engine cycle error: {inner_e}", exc_info=True)
+                    try:
+                        await db.rollback()
+                    except Exception:
+                        pass
+                    result = {
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "status": "error",
+                        "errors": [str(inner_e)],
+                    }
+
                 self.last_result = result
                 self.history.append(result)
                 if len(self.history) > 50:
@@ -44,7 +57,7 @@ class BotRunner:
                         f"Signal: {signal.get('direction', 'N/A')}"
                     )
         except Exception as e:
-            logger.error(f"Cycle error: {e}", exc_info=True)
+            logger.error(f"Cycle error (outer): {e}", exc_info=True)
             self.last_result = {
                 "timestamp": datetime.utcnow().isoformat(),
                 "status": "error",
@@ -62,8 +75,14 @@ class BotRunner:
         self.is_running = True
         self.engine.is_running = True
 
-        # Run first cycle immediately in background
-        asyncio.create_task(self._run_cycle())
+        # Run first cycle immediately in background (fire-and-forget safe)
+        async def _safe_first_cycle():
+            try:
+                await self._run_cycle()
+            except Exception as e:
+                logger.error(f"First cycle failed: {e}", exc_info=True)
+
+        asyncio.create_task(_safe_first_cycle())
 
         # Then schedule repeating cycles
         interval = settings.bot_interval_seconds
@@ -77,6 +96,7 @@ class BotRunner:
             id="trading_cycle",
             replace_existing=True,
             max_instances=1,
+            misfire_grace_time=60,
         )
         logger.info(f"Bot started - first cycle running now, then every {interval}s")
 
