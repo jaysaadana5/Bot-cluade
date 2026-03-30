@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { getPolymarketStatus, derivePolymarketCredentials, getPolymarketBalance } from '../services/api';
+import { getPolymarketStatus, derivePolymarketCredentials, getPolymarketBalance, updateTradeAmounts } from '../services/api';
 
 function SettingsPanel({ settings, tradingMode, onModeChange, onNotify }) {
   const [switching, setSwitching] = useState(false);
@@ -8,11 +8,31 @@ function SettingsPanel({ settings, tradingMode, onModeChange, onNotify }) {
   const [polyBalance, setPolyBalance] = useState(null);
   const [generating, setGenerating] = useState(false);
   const [generatedCreds, setGeneratedCreds] = useState(null);
+  const [minAmt, setMinAmt] = useState(settings?.min_trade_amount || 2);
+  const [maxAmt, setMaxAmt] = useState(settings?.max_trade_amount || 5);
+  const [savingAmts, setSavingAmts] = useState(false);
 
   useEffect(() => {
     getPolymarketStatus().then(r => setPolyStatus(r.data)).catch(() => {});
     getPolymarketBalance().then(r => setPolyBalance(r.data)).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (settings?.min_trade_amount) setMinAmt(settings.min_trade_amount);
+    if (settings?.max_trade_amount) setMaxAmt(settings.max_trade_amount);
+  }, [settings]);
+
+  const handleSaveAmounts = async () => {
+    setSavingAmts(true);
+    try {
+      await updateTradeAmounts(parseFloat(minAmt), parseFloat(maxAmt));
+      if (onNotify) onNotify(`Trade amounts updated: $${minAmt} - $${maxAmt}`, 'success');
+    } catch (err) {
+      const msg = err?.response?.data?.detail || 'Failed to update trade amounts';
+      if (onNotify) onNotify(msg, 'error');
+    }
+    setSavingAmts(false);
+  };
 
   const handleModeToggle = async () => {
     const newMode = tradingMode === 'paper' ? 'live' : 'paper';
@@ -287,6 +307,84 @@ function SettingsPanel({ settings, tradingMode, onModeChange, onNotify }) {
           </div>
         </div>
       )}
+
+      {/* Trade Amount Config */}
+      <div style={{
+        padding: '1rem',
+        marginBottom: '1rem',
+        background: 'rgba(59, 130, 246, 0.1)',
+        border: '1px solid rgba(59, 130, 246, 0.3)',
+        borderRadius: '10px',
+      }}>
+        <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '0.5rem' }}>
+          Trade Amount (per trade)
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          <div style={{ flex: 1 }}>
+            <label style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'block', marginBottom: '0.25rem' }}>Min $</label>
+            <input
+              type="number"
+              value={minAmt}
+              onChange={(e) => setMinAmt(e.target.value)}
+              min="0.5"
+              max="100"
+              step="0.5"
+              style={{
+                width: '100%',
+                padding: '0.4rem 0.6rem',
+                borderRadius: '6px',
+                border: '1px solid rgba(51, 65, 85, 0.5)',
+                background: 'var(--bg-primary)',
+                color: 'var(--text-primary)',
+                fontWeight: 600,
+                fontSize: '0.9rem',
+                fontFamily: 'monospace',
+              }}
+            />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'block', marginBottom: '0.25rem' }}>Max $</label>
+            <input
+              type="number"
+              value={maxAmt}
+              onChange={(e) => setMaxAmt(e.target.value)}
+              min="0.5"
+              max="100"
+              step="0.5"
+              style={{
+                width: '100%',
+                padding: '0.4rem 0.6rem',
+                borderRadius: '6px',
+                border: '1px solid rgba(51, 65, 85, 0.5)',
+                background: 'var(--bg-primary)',
+                color: 'var(--text-primary)',
+                fontWeight: 600,
+                fontSize: '0.9rem',
+                fontFamily: 'monospace',
+              }}
+            />
+          </div>
+          <button
+            onClick={handleSaveAmounts}
+            disabled={savingAmts}
+            style={{
+              marginTop: '1rem',
+              padding: '0.45rem 1rem',
+              borderRadius: '6px',
+              border: 'none',
+              fontWeight: 600,
+              fontSize: '0.8rem',
+              cursor: savingAmts ? 'not-allowed' : 'pointer',
+              background: 'var(--blue)',
+              color: '#fff',
+              opacity: savingAmts ? 0.6 : 1,
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {savingAmts ? 'Saving...' : 'Save'}
+          </button>
+        </div>
+      </div>
 
       {/* Settings List */}
       <div>

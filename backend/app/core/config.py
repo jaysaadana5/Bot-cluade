@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     # Trading
     trading_mode: str = "paper"  # "paper" or "live"
     bot_interval_seconds: int = 300
+    min_trade_amount: float = 2.0    # Minimum $ per trade
+    max_trade_amount: float = 5.0    # Maximum $ per trade
     max_position_size: float = 100.0
     risk_per_trade: float = 0.02
     stop_loss_pct: float = 0.05

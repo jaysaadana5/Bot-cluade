@@ -51,6 +51,8 @@ export const cancelAllOrders = () => api.post('/polymarket/cancel-all');
 
 // Settings
 export const getSettings = () => api.get('/settings');
+export const updateTradeAmounts = (minAmount, maxAmount) =>
+  api.post('/settings/trade-amounts', null, { params: { min_amount: minAmount, max_amount: maxAmount } });
 
 // Health
 export const getHealth = () => axios.get(`${API_BASE}/health`);

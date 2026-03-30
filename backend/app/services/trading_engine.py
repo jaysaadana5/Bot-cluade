@@ -374,7 +374,37 @@ class TradingEngine:
             except Exception:
                 pass
 
-            # 8. EXECUTE PAPER TRADE (guaranteed to happen)
+            # 8. SETTLE PREVIOUS PAPER TRADES - calculate P&L from BTC price change
+            try:
+                unsettled = await db.execute(
+                    select(Trade).where(
+                        Trade.status == "paper_filled",
+                        Trade.pnl == 0.0,
+                    )
+                )
+                unsettled_trades = unsettled.scalars().all()
+                for old_trade in unsettled_trades:
+                    entry_price = old_trade.price  # BTC price at entry
+                    if entry_price > 0 and current_btc_price > 0:
+                        pct_change = (current_btc_price - entry_price) / entry_price
+                        if old_trade.side == "SELL":
+                            pct_change = -pct_change
+                        pnl = round(old_trade.size * pct_change * 100, 2)  # size is $ amount
+                        old_trade.pnl = pnl
+                        old_trade.status = "settled"
+                        old_trade.notes = (old_trade.notes or "") + f" | Exit: ${current_btc_price:,.2f} P&L: ${pnl:+.2f}"
+                        self.paper_engine.balance += pnl
+                        self.risk_manager.update(pnl, {
+                            "momentum": regime.get("momentum", 0),
+                            "volatility": regime.get("volatility", 0),
+                            "regime": regime.get("regime", "UNKNOWN"),
+                        })
+                        logger.info(f"[SETTLED] {old_trade.side} entry=${entry_price:,.2f} exit=${current_btc_price:,.2f} P&L=${pnl:+.2f}")
+            except Exception as e:
+                logger.warning(f"P&L settlement error: {e}")
+
+            # 9. EXECUTE NEW PAPER TRADE (guaranteed to happen)
+            market["btc_entry_price"] = current_btc_price
             trade_result = await self._execute_trade(
                 db, market,
                 {**combined_signal, "direction": trade_direction, "confidence": trade_confidence},
@@ -382,25 +412,9 @@ class TradingEngine:
             )
             result["trade"] = trade_result
             logger.info(
-                f"[PAPER TRADE] {trade_direction} {trade_result.get('size', 0):.2f}"
-                f"@{trade_result.get('price', 0):.4f} | {trade_reasons[-1]}"
+                f"[PAPER TRADE] {trade_direction} ${trade_result.get('amount', 0):.2f} "
+                f"BTC@${current_btc_price:,.2f} | {trade_reasons[-1]}"
             )
-
-            # 9. Check paper position exits
-            exit_price = poly_prices[-1] if poly_prices else market.get("yes_price", 0.5)
-            if exit_price > 0:
-                exits = self.paper_engine.check_exits(
-                    exit_price,
-                    stop_loss=settings.stop_loss_pct,
-                    take_profit=settings.take_profit_pct,
-                )
-                for exit_pos in exits:
-                    pnl = exit_pos.get("pnl", 0)
-                    self.risk_manager.update(pnl, {
-                        "momentum": regime.get("momentum", 0),
-                        "volatility": regime.get("volatility", 0),
-                        "regime": regime.get("regime", "UNKNOWN"),
-                    })
 
             # 10. Update bot state and COMMIT
             await self._update_bot_state(db)
@@ -594,18 +608,25 @@ class TradingEngine:
         direction = signal["direction"]
         confidence = signal.get("confidence", 0.5)
 
-        base_size = settings.max_position_size * settings.risk_per_trade
-        size = base_size * (0.5 + confidence * 0.5)
-        size = max(1.0, min(size, settings.max_position_size))
+        # Trade amount: scale between min ($2) and max ($5) based on confidence
+        min_amt = settings.min_trade_amount
+        max_amt = settings.max_trade_amount
+        trade_amount = min_amt + (max_amt - min_amt) * confidence
+        trade_amount = round(max(min_amt, min(trade_amount, max_amt)), 2)
+
+        # BTC entry price for P&L tracking
+        btc_entry = market.get("btc_entry_price", 0)
 
         if direction == "BUY":
             token_id = market.get("yes_token", "")
             price = market.get("yes_price", 0.5)
-            limit_price = min(price + 0.01, 0.99)
         else:
             token_id = market.get("no_token") or market.get("yes_token", "")
             price = market.get("no_price", market.get("yes_price", 0.5))
-            limit_price = min(price + 0.01, 0.99)
+
+        # Size = trade_amount / price (number of contracts/shares)
+        limit_price = min(price + 0.01, 0.99) if price > 0 else 0.50
+        size = round(trade_amount / limit_price, 2) if limit_price > 0 else trade_amount
 
         if self.trading_mode == "paper":
             order_result = self.paper_engine.place_order(
@@ -624,18 +645,19 @@ class TradingEngine:
 
         trade = Trade(
             market_id=market.get("id", ""),
-            market_name=market.get("question", ""),
+            market_name=f"BTC 5min {direction}",
             side=direction,
             token_id=token_id,
-            price=limit_price,
-            size=size,
-            total_cost=limit_price * size,
+            price=btc_entry if btc_entry > 0 else limit_price,
+            size=trade_amount,
+            total_cost=trade_amount,
             order_id=order_result.get("order_id", ""),
             status=status,
             strategy=f"regime_{regime.get('regime', 'unknown').lower()}",
             signal_strength=confidence,
             notes=(
-                f"Mode: {self.trading_mode} | Regime: {regime.get('regime', '?')} | "
+                f"BTC Entry: ${btc_entry:,.2f} | Amount: ${trade_amount:.2f} | "
+                f"Regime: {regime.get('regime', '?')} | "
                 f"Momentum: {regime.get('momentum', 0):.0f}bp | "
                 f"Score: {signal.get('combined_score', 0):.3f}"
             ),
@@ -643,38 +665,37 @@ class TradingEngine:
         db.add(trade)
 
         logger.info(
-            f"[{self.trading_mode.upper()}] {direction} {size:.2f}@{limit_price:.4f} "
-            f"on {market.get('question', '')[:50]} (regime={regime.get('regime', '?')})"
+            f"[{self.trading_mode.upper()}] {direction} ${trade_amount:.2f} "
+            f"BTC@${btc_entry:,.2f} (conf={confidence:.2f}, regime={regime.get('regime', '?')})"
         )
 
         return {
             "mode": self.trading_mode,
             "side": direction,
+            "btc_price": btc_entry,
+            "amount": trade_amount,
             "price": limit_price,
             "size": size,
-            "total_cost": limit_price * size,
+            "total_cost": trade_amount,
             "order_id": trade.order_id,
             "status": status,
-            "market": market.get("question", ""),
+            "market": f"BTC 5min {direction}",
             "regime": regime.get("regime", "?"),
             "confidence": confidence,
         }
 
     @staticmethod
     def _create_synthetic_market(btc_price: float) -> dict:
-        """Create a synthetic BTC market for paper trading."""
-        round_target = round(btc_price / 1000) * 1000
-        distance_pct = (btc_price - round_target) / round_target
-        yes_price = max(0.10, min(0.90, 0.50 + distance_pct * 5))
-
+        """Create a BTC 5min UP/DOWN market for paper trading."""
         return {
-            "id": f"synthetic_btc_{int(btc_price)}",
-            "question": f"Will BTC be above ${round_target:,.0f} at end of hour?",
-            "description": f"Synthetic paper-trading market. BTC spot: ${btc_price:,.2f}",
-            "yes_token": f"syn_yes_{int(btc_price)}",
-            "no_token": f"syn_no_{int(btc_price)}",
-            "yes_price": round(yes_price, 4),
-            "no_price": round(1 - yes_price, 4),
+            "id": f"btc_5min_{int(btc_price)}",
+            "question": f"BTC 5min UP/DOWN",
+            "description": f"BTC 5-minute direction signal. Spot: ${btc_price:,.2f}",
+            "yes_token": f"btc5m_up_{int(btc_price)}",
+            "no_token": f"btc5m_down_{int(btc_price)}",
+            "yes_price": 0.50,
+            "no_price": 0.50,
+            "btc_entry_price": btc_price,
             "volume": 100000,
             "liquidity": 50000,
             "end_date": "",

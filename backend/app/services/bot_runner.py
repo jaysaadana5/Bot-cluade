@@ -3,7 +3,7 @@ Bot Runner - manages the 5-minute trading loop using APScheduler.
 """
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from .trading_engine import TradingEngine
@@ -21,11 +21,15 @@ class BotRunner:
         self.last_result = None
         self.cycle_count = 0
         self.history = []
+        self.last_cycle_at = None
+        self.next_cycle_at = None
 
     async def _run_cycle(self):
         """Internal cycle runner - never raises, always returns a result."""
         self.cycle_count += 1
-        logger.info(f"=== Trading Cycle #{self.cycle_count} @ {datetime.utcnow().isoformat()} ===")
+        self.last_cycle_at = datetime.utcnow()
+        self.next_cycle_at = self.last_cycle_at + timedelta(seconds=settings.bot_interval_seconds)
+        logger.info(f"=== Trading Cycle #{self.cycle_count} @ {self.last_cycle_at.isoformat()} ===")
 
         try:
             async with async_session() as db:
@@ -122,11 +126,21 @@ class BotRunner:
         return await self._run_cycle()
 
     def get_status(self) -> dict:
+        now = datetime.utcnow()
+        seconds_until_next = 0
+        if self.next_cycle_at and self.is_running:
+            seconds_until_next = max(0, int((self.next_cycle_at - now).total_seconds()))
+
         return {
             "is_running": self.is_running,
             "trading_mode": self.engine.trading_mode,
             "cycle_count": self.cycle_count,
             "interval_seconds": settings.bot_interval_seconds,
+            "last_cycle_at": self.last_cycle_at.isoformat() if self.last_cycle_at else None,
+            "next_cycle_at": self.next_cycle_at.isoformat() if self.next_cycle_at else None,
+            "seconds_until_next": seconds_until_next,
+            "min_trade_amount": settings.min_trade_amount,
+            "max_trade_amount": settings.max_trade_amount,
             "last_result": self.last_result,
             "last_signal": self.engine.last_signal,
             "selected_market": self.engine.selected_market,

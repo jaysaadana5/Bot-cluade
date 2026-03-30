@@ -241,6 +241,8 @@ async def get_settings():
     return {
         "trading_mode": bot_runner.engine.trading_mode if bot_runner else settings.trading_mode,
         "interval_seconds": settings.bot_interval_seconds,
+        "min_trade_amount": settings.min_trade_amount,
+        "max_trade_amount": settings.max_trade_amount,
         "max_position_size": settings.max_position_size,
         "risk_per_trade": settings.risk_per_trade,
         "stop_loss_pct": settings.stop_loss_pct,
@@ -251,6 +253,23 @@ async def get_settings():
         "polymarket_funder": settings.polymarket_funder or "",
         "sentiment_source": "cointelegraph",
         "paper_starting_balance": settings.paper_starting_balance,
+    }
+
+
+@router.post("/settings/trade-amounts")
+async def update_trade_amounts(min_amount: float = 2.0, max_amount: float = 5.0):
+    """Update min/max trade amounts (persists until restart)."""
+    from ..core.config import settings
+    if min_amount < 0.5 or max_amount > 100:
+        raise HTTPException(400, "Trade amount must be between $0.50 and $100")
+    if min_amount > max_amount:
+        raise HTTPException(400, "Min amount cannot exceed max amount")
+    settings.min_trade_amount = round(min_amount, 2)
+    settings.max_trade_amount = round(max_amount, 2)
+    return {
+        "status": "ok",
+        "min_trade_amount": settings.min_trade_amount,
+        "max_trade_amount": settings.max_trade_amount,
     }
 
 
