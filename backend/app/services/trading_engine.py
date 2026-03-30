@@ -366,17 +366,19 @@ class TradingEngine:
                 unsettled = await db.execute(
                     select(Trade).where(
                         Trade.status == "paper_filled",
-                        Trade.pnl == 0.0,
                     )
                 )
                 unsettled_trades = unsettled.scalars().all()
                 for old_trade in unsettled_trades:
                     entry_price = old_trade.price  # BTC price at entry
-                    if entry_price > 0 and current_btc_price > 0:
+                    # Only settle trades that have a real BTC entry price (> $100)
+                    # Old trades with odds-style prices (0.5) are skipped
+                    if entry_price > 100 and current_btc_price > 100:
                         pct_change = (current_btc_price - entry_price) / entry_price
                         if old_trade.side == "SELL":
                             pct_change = -pct_change
-                        pnl = round(old_trade.size * pct_change * 100, 2)  # size is $ amount
+                        trade_amt = old_trade.total_cost or old_trade.size or 2.0
+                        pnl = round(trade_amt * pct_change * 100, 2)
                         old_trade.pnl = pnl
                         old_trade.status = "settled"
                         old_trade.notes = (old_trade.notes or "") + f" | Exit: ${current_btc_price:,.2f} P&L: ${pnl:+.2f}"
@@ -387,6 +389,10 @@ class TradingEngine:
                             "regime": regime.get("regime", "UNKNOWN"),
                         })
                         logger.info(f"[SETTLED] {old_trade.side} entry=${entry_price:,.2f} exit=${current_btc_price:,.2f} P&L=${pnl:+.2f}")
+                    elif entry_price <= 100:
+                        # Old format trade - just mark as settled with $0 P&L
+                        old_trade.status = "settled"
+                        old_trade.pnl = 0
             except Exception as e:
                 logger.warning(f"P&L settlement error: {e}")
 

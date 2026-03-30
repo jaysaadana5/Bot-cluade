@@ -27,4 +27,12 @@ RUN mkdir -p /app/data
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# Cleanup stale files that may crash startup
+RUN echo '#!/bin/sh\n\
+# Remove bot.log if it is accidentally a directory\n\
+[ -d /app/data/bot.log ] && rm -rf /app/data/bot.log\n\
+[ -d /app/bot.log ] && rm -rf /app/bot.log\n\
+exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1\n\
+' > /app/start.sh && chmod +x /app/start.sh
+
+CMD ["/app/start.sh"]
