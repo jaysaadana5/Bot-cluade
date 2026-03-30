@@ -18,17 +18,8 @@ from .services.trading_engine import TradingEngine
 from .services.bot_runner import BotRunner
 from .api.routes import router, set_dependencies
 
-# Configure logging
+# Configure logging - stdout only (no file logging to avoid Docker volume issues)
 log_handlers = [logging.StreamHandler()]
-try:
-    os.makedirs("data", exist_ok=True)
-    log_path = os.path.join("data", "bot.log")
-    # Remove if it's accidentally a directory
-    if os.path.isdir(log_path):
-        os.rmdir(log_path)
-    log_handlers.append(logging.FileHandler(log_path, mode="a"))
-except Exception:
-    pass  # Skip file logging if directory not writable
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,44 +40,53 @@ bot_runner_instance = None
 async def lifespan(app: FastAPI):
     global polymarket_client, sentiment_analyzer, price_feed, trading_engine, bot_runner_instance
 
-    logger.info("Starting Polymarket BTC Trading Bot...")
+    try:
+        logger.info("Starting Polymarket BTC Trading Bot...")
 
-    # Init database
-    await init_db()
+        # Init database
+        await init_db()
 
-    # Init services
-    polymarket_client = PolymarketClient(
-        api_key=settings.polymarket_api_key,
-        secret=settings.polymarket_secret,
-        passphrase=settings.polymarket_passphrase,
-        funder=settings.polymarket_funder,
-        private_key=settings.polymarket_private_key,
-    )
-    sentiment_analyzer = CoinTelegraphSentiment()
-    price_feed = BTCPriceFeed()
-    trading_engine = TradingEngine(polymarket_client, sentiment_analyzer, price_feed)
-    bot_runner_instance = BotRunner(trading_engine)
+        # Init services
+        polymarket_client = PolymarketClient(
+            api_key=settings.polymarket_api_key,
+            secret=settings.polymarket_secret,
+            passphrase=settings.polymarket_passphrase,
+            funder=settings.polymarket_funder,
+            private_key=settings.polymarket_private_key,
+        )
+        sentiment_analyzer = CoinTelegraphSentiment()
+        price_feed = BTCPriceFeed()
+        trading_engine = TradingEngine(polymarket_client, sentiment_analyzer, price_feed)
+        bot_runner_instance = BotRunner(trading_engine)
 
-    # Wire up API routes
-    set_dependencies(bot_runner_instance, polymarket_client, sentiment_analyzer)
+        # Wire up API routes
+        set_dependencies(bot_runner_instance, polymarket_client, sentiment_analyzer)
 
-    logger.info("All services initialized")
-    logger.info(f"Trading Mode: {settings.trading_mode.upper()}")
-    logger.info(f"Polymarket API: {'LIVE READY' if polymarket_client.is_live_ready else 'configured (key only)' if settings.polymarket_private_key else 'PAPER MODE'}")
-    logger.info("Sentiment: CoinTelegraph RSS (no API key needed)")
+        logger.info("All services initialized")
+        logger.info(f"Trading Mode: {settings.trading_mode.upper()}")
+        logger.info(f"Trade Amount: ${settings.min_trade_amount}-${settings.max_trade_amount}")
+        logger.info("Market: BTC 5min UP/DOWN")
+        logger.info("Sentiment: CoinTelegraph RSS (no API key needed)")
+
+    except Exception as e:
+        logger.error(f"Startup error: {e}", exc_info=True)
+        # Still yield so the app starts (health endpoint works for debugging)
 
     yield
 
     # Shutdown
     logger.info("Shutting down...")
-    if bot_runner_instance and bot_runner_instance.is_running:
-        bot_runner_instance.stop()
-    if polymarket_client:
-        await polymarket_client.close()
-    if sentiment_analyzer:
-        await sentiment_analyzer.close()
-    if price_feed:
-        await price_feed.close()
+    try:
+        if bot_runner_instance and bot_runner_instance.is_running:
+            bot_runner_instance.stop()
+        if polymarket_client:
+            await polymarket_client.close()
+        if sentiment_analyzer:
+            await sentiment_analyzer.close()
+        if price_feed:
+            await price_feed.close()
+    except Exception as e:
+        logger.error(f"Shutdown error: {e}")
 
 
 app = FastAPI(

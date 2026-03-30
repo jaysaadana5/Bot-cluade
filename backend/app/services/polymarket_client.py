@@ -58,15 +58,18 @@ class PolymarketClient:
         try:
             from py_clob_client.client import ClobClient
             from py_clob_client.clob_types import ApiCreds
+        except (ImportError, Exception) as e:
+            logger.warning(f"py-clob-client not available: {e} - paper mode only")
+            self._clob_client = None
+            return
 
-            # Create CLOB client with private key for order signing
+        try:
             self._clob_client = ClobClient(
                 POLYMARKET_CLOB_URL,
                 key=self.private_key,
                 chain_id=POLYGON_CHAIN_ID,
             )
 
-            # If we have API creds, set them on the client
             if self.api_key and self.secret and self.passphrase:
                 self._clob_client.set_api_creds(ApiCreds(
                     api_key=self.api_key,
@@ -77,13 +80,10 @@ class PolymarketClient:
                 logger.info("CLOB client initialized with API credentials")
             else:
                 logger.info("CLOB client created (private key only, no API creds yet)")
-
-        except ImportError:
-            logger.warning("py-clob-client not installed - paper mode only. Run: pip install py-clob-client")
-            self._clob_client = None
-        except Exception as e:
+        except BaseException as e:
             logger.warning(f"CLOB client init failed (paper mode still works): {e}")
             self._clob_client = None
+            self._clob_initialized = False
 
     async def derive_api_credentials(self) -> dict:
         """
