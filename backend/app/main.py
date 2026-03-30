@@ -75,11 +75,14 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down...")
-    if bot_runner_instance.is_running:
+    if bot_runner_instance and bot_runner_instance.is_running:
         bot_runner_instance.stop()
-    await polymarket_client.close()
-    await sentiment_analyzer.close()
-    await price_feed.close()
+    if polymarket_client:
+        await polymarket_client.close()
+    if sentiment_analyzer:
+        await sentiment_analyzer.close()
+    if price_feed:
+        await price_feed.close()
 
 
 app = FastAPI(

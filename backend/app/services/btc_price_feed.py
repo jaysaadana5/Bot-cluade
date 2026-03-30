@@ -77,7 +77,7 @@ class BTCPriceFeed:
             resp.raise_for_status()
             result = resp.json()
 
-            if not result.get("data") or not result["data"][0].get("d"):
+            if not result.get("data") or len(result["data"]) == 0 or not result["data"][0].get("d"):
                 logger.warning("TradingView returned empty data")
                 return self.last_5m_data if interval == "5" else self.last_data
 

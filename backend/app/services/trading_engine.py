@@ -703,6 +703,8 @@ class TradingEngine:
         return odds
 
     def _select_best_market(self, markets: list[dict]) -> dict:
+        if not markets:
+            return self._create_synthetic_market(0)
         scored = []
         for m in markets:
             if m.get("closed") or not m.get("active"):

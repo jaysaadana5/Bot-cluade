@@ -49,9 +49,13 @@ def detect_regime(prices: list[float], window: int = 20) -> dict:
     - ADX-like directional index
     """
     if len(prices) < window:
-        return {"regime": "UNKNOWN", "momentum": 0, "volatility": 0, "direction": 0}
+        return {"regime": "UNKNOWN", "momentum": 0, "volatility": 0, "direction": 0, "trend_efficiency": 0}
 
     recent = prices[-window:]
+    # Guard against zero prices
+    if recent[0] == 0 or any(p == 0 for p in recent[:-1]):
+        return {"regime": "UNKNOWN", "momentum": 0, "volatility": 0, "direction": 0, "trend_efficiency": 0}
+
     returns = np.diff(recent) / recent[:-1]
 
     # Momentum: net directional move
