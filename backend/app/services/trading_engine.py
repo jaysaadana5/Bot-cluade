@@ -155,8 +155,8 @@ class TradingEngine:
 
     async def _run_paper_cycle(self, db: AsyncSession) -> dict:
         """
-        Paper mode cycle - more aggressive, always tries to trade.
-        Uses lower thresholds and relaxed filters for algorithm testing.
+        Paper mode cycle - ALWAYS places a trade every cycle for testing.
+        Uses TradingView pre-computed indicators as primary signal source.
         """
         cycle_start = datetime.utcnow()
         self.auto_tuner.tick()
@@ -175,258 +175,222 @@ class TradingEngine:
         }
 
         try:
-            # 0. Check cooldown (shorter in paper: 30 min instead of hours)
-            if self.risk_manager.in_cooldown():
-                result["status"] = "cooldown"
-                result["errors"].append(
-                    f"In cooldown until {self.risk_manager.cooldown_end.isoformat()}"
-                )
-                return result
+            # 0. Skip cooldown in paper mode - we always want to see trades
+            # (cooldown only matters for live)
 
-            # 1. Get BTC price data from TradingView
-            tv_data = await self.price_feed.get_tradingview_analysis(interval="5")
-            candles = await self.price_feed.get_5m_candles(limit=50)
-            spot_prices = self.price_feed.extract_prices(candles) if candles else []
-            spot_volumes = self.price_feed.extract_volumes(candles) if candles else []
+            # 1. Get BTC data from TradingView scanner (always works)
+            tv_data = {}
+            try:
+                tv_data = await self.price_feed.get_tradingview_analysis(interval="5") or {}
+            except Exception as e:
+                logger.warning(f"TradingView scanner failed: {e}")
 
-            if not spot_prices and tv_data.get("price"):
-                spot_prices = [tv_data["price"]] * 30
+            # 2. Get candle data from Binance (always works, no key needed)
+            candles = []
+            spot_prices = []
+            spot_volumes = []
+            try:
+                candles = await self.price_feed.get_5m_candles(limit=50) or []
+                spot_prices = self.price_feed.extract_prices(candles) if candles else []
+                spot_volumes = self.price_feed.extract_volumes(candles) if candles else []
+            except Exception as e:
+                logger.warning(f"Candle fetch failed: {e}")
 
-            current_btc_price = spot_prices[-1] if spot_prices else tv_data.get("price", 0)
+            # Determine BTC price from best available source
+            current_btc_price = 0
+            if spot_prices:
+                current_btc_price = spot_prices[-1]
+            elif tv_data.get("price"):
+                current_btc_price = tv_data["price"]
+                # Build minimal price series from scanner snapshot
+                spot_prices = [current_btc_price] * 30
 
             if current_btc_price == 0:
                 result["status"] = "error"
-                result["errors"].append("Could not fetch BTC price")
+                result["errors"].append("Could not fetch BTC price from any source")
+                logger.error("[PAPER] No BTC price available from TradingView or Binance")
                 return result
 
-            # 2. Try real Polymarket markets, fall back to synthetic
-            markets = await self.polymarket.get_btc_markets()
+            logger.info(f"[PAPER] BTC=${current_btc_price:.2f}, candles={len(candles)}")
+
+            # 3. Create synthetic market (always works in paper mode)
+            use_synthetic = True
+            markets = []
+            try:
+                markets = await self.polymarket.get_btc_markets()
+            except Exception:
+                pass
+
             result["markets_scanned"] = len(markets)
-            use_synthetic = False
 
             if not markets:
-                use_synthetic = True
                 markets = [self._create_synthetic_market(current_btc_price)]
-                logger.info(f"Paper mode: synthetic market (BTC=${current_btc_price:.0f})")
+            else:
+                use_synthetic = False
 
             result["synthetic_market"] = use_synthetic
             market = self._select_best_market(markets)
             self.selected_market = market
-            logger.info(f"Selected market: {market['question']}")
 
-            # 3. Polymarket odds data (synthetic if needed)
-            token_id = market.get("yes_token")
-            poly_prices = []
+            # 4. Poly prices (synthetic from spot data)
+            poly_prices = self._derive_synthetic_odds(spot_prices) if spot_prices else [0.5] * 30
 
-            if not use_synthetic and token_id:
-                try:
-                    poly_history = await self.polymarket.get_price_history(token_id)
-                    poly_prices = [float(p.get("p", p.get("price", 0.5))) for p in poly_history if p]
-                except Exception:
-                    pass
-
-                if len(poly_prices) < 5:
-                    try:
-                        midpoint = await self.polymarket.get_midpoint(token_id)
-                        poly_prices = [midpoint or market.get("yes_price", 0.5)] * 30
-                    except Exception:
-                        pass
-
-            if len(poly_prices) < 5 and spot_prices:
-                poly_prices = self._derive_synthetic_odds(spot_prices)
-
-            # 4. Detect regime
+            # 5. Detect regime
             regime = detect_regime(spot_prices) if len(spot_prices) >= 20 else {
                 "regime": "RANGE", "momentum": 0, "volatility": 0,
                 "direction": 0, "trend_efficiency": 0,
             }
             result["regime"] = regime
 
-            # 5. Regime decision (paper uses lower threshold)
-            current_price = spot_prices[-1] if spot_prices else current_btc_price
-            previous_price = spot_prices[-6] if len(spot_prices) >= 6 else current_price
-            regime_decision = make_regime_decision(
-                regime, current_price, previous_price, self._paper_config
-            )
+            # 6. Sentiment (non-blocking)
+            sentiment_result = {"score": 0, "tweet_count": 0, "bullish": 0, "bearish": 0, "confidence": 0}
+            try:
+                sentiment_result = await self.sentiment.analyze_btc_sentiment()
+            except Exception as e:
+                logger.warning(f"Sentiment fetch failed: {e}")
 
-            # 6. TA signals
-            spot_signal = generate_technical_signal(spot_prices, volumes=spot_volumes, label="spot")
-            poly_signal = generate_technical_signal(poly_prices, label="polymarket")
+            try:
+                db.add(SentimentLog(
+                    source="cointelegraph", keyword="BTC",
+                    score=sentiment_result.get("score", 0),
+                    tweet_count=sentiment_result.get("tweet_count", 0),
+                    bullish_count=sentiment_result.get("bullish", 0),
+                    bearish_count=sentiment_result.get("bearish", 0),
+                ))
+            except Exception:
+                pass
 
-            # 7. Divergence
-            divergence = analyze_spot_vs_polymarket_divergence(spot_prices, poly_prices)
-
-            # 8. Sentiment
-            sentiment_result = await self.sentiment.analyze_btc_sentiment()
-            sent_log = SentimentLog(
-                source="cointelegraph", keyword="BTC",
-                score=sentiment_result["score"],
-                tweet_count=sentiment_result["tweet_count"],
-                bullish_count=sentiment_result["bullish"],
-                bearish_count=sentiment_result["bearish"],
-            )
-            db.add(sent_log)
-
-            # 9. Order book (skip for synthetic)
-            book_pressure = analyze_book_pressure({"buy_pressure": 0.5})
-            if token_id and not use_synthetic:
-                try:
-                    orderbook = await self.polymarket.get_orderbook(token_id)
-                    if orderbook.get("bids") and orderbook.get("asks"):
-                        bid_vol = sum(float(b.get("size", 0)) for b in orderbook["bids"][:10])
-                        ask_vol = sum(float(a.get("size", 0)) for a in orderbook["asks"][:10])
-                        total = bid_vol + ask_vol
-                        bp = bid_vol / total if total > 0 else 0.5
-                        book_pressure = analyze_book_pressure({"buy_pressure": bp})
-                except Exception:
-                    pass
-
-            # 10. Combine signals
-            combined = combine_dual_chart_signals(
-                spot_signal=spot_signal,
-                poly_signal=poly_signal,
-                divergence=divergence,
-                sentiment=sentiment_result,
-                book_pressure=book_pressure,
-            )
-
-            # 11. Paper mode: multi-source signal cascade
-            #     Uses TradingView's pre-computed indicators as primary source
-            #     (these ALWAYS work, unlike locally computed TA from candles)
-            trade_direction = None
-            trade_confidence = 0
-            trade_reasons = list(combined.get("reasons", []))
-
-            # Get TradingView's pre-computed values (always available)
-            tv_rec = tv_data.get("recommend_all", 0) or 0
-            tv_rsi = tv_data.get("rsi", 50) or 50
-            tv_macd = tv_data.get("macd", 0) or 0
-            tv_macd_signal = tv_data.get("macd_signal", 0) or 0
-            tv_rec_ma = tv_data.get("recommend_ma", 0) or 0
-            tv_rec_osc = tv_data.get("recommend_oscillators", 0) or 0
-            tv_momentum = tv_data.get("momentum", 0) or 0
-            tv_stoch_k = tv_data.get("stoch_k", 50) or 50
+            # 7. Determine trade direction using TradingView's PRE-COMPUTED indicators
+            #    These are calculated by TradingView from ALL their indicators - always reliable
+            tv_rec = tv_data.get("recommend_all") or 0
+            tv_rsi = tv_data.get("rsi") or 50
+            tv_macd = tv_data.get("macd") or 0
+            tv_macd_signal = tv_data.get("macd_signal") or 0
+            tv_rec_ma = tv_data.get("recommend_ma") or 0
+            tv_rec_osc = tv_data.get("recommend_oscillators") or 0
+            tv_momentum = tv_data.get("momentum") or 0
+            tv_stoch_k = tv_data.get("stoch_k") or 50
+            tv_change = tv_data.get("change") or 0
 
             logger.info(
-                f"[PAPER] TV signals: rec={tv_rec:.3f}, RSI={tv_rsi:.1f}, "
-                f"MACD={tv_macd:.2f}, StochK={tv_stoch_k:.1f}, mom={tv_momentum:.2f}"
+                f"[PAPER] TV: rec={tv_rec:.3f} rsi={tv_rsi:.1f} macd={tv_macd:.1f} "
+                f"stoch={tv_stoch_k:.1f} mom={tv_momentum:.1f} chg={tv_change:.3f}%"
             )
 
-            # Signal 1: Combined TA (if candle data was good enough)
-            if combined["direction"] != "HOLD" and combined.get("confidence", 0) > 0.10:
-                trade_direction = combined["direction"]
-                trade_confidence = combined["confidence"]
-                trade_reasons.append("[COMBINED-TA] Multi-indicator agreement")
+            trade_direction = None
+            trade_confidence = 0
+            trade_reasons = []
 
-            # Signal 2: TradingView's overall recommendation (MOST RELIABLE)
-            if not trade_direction and abs(tv_rec) > 0.1:
-                if tv_rec > 0.1:
+            # --- Signal cascade: try each until one triggers ---
+
+            # 1. TV recommendation (works even at low values for paper mode)
+            if not trade_direction and tv_rec != 0:
+                if tv_rec > 0.05:
                     trade_direction = "BUY"
-                    trade_confidence = min(0.3 + abs(tv_rec) * 0.5, 0.85)
+                    trade_confidence = min(0.3 + abs(tv_rec), 0.9)
                     trade_reasons.append(
-                        f"[TV-REC] TradingView: {tv_data.get('recommendation', '?')} "
-                        f"(all={tv_rec:.3f}, MA={tv_rec_ma:.3f}, osc={tv_rec_osc:.3f})"
+                        f"[TV] Recommend BUY (all={tv_rec:.3f}, MA={tv_rec_ma:.3f}, osc={tv_rec_osc:.3f})"
                     )
-                else:
+                elif tv_rec < -0.05:
                     trade_direction = "SELL"
-                    trade_confidence = min(0.3 + abs(tv_rec) * 0.5, 0.85)
+                    trade_confidence = min(0.3 + abs(tv_rec), 0.9)
                     trade_reasons.append(
-                        f"[TV-REC] TradingView: {tv_data.get('recommendation', '?')} "
-                        f"(all={tv_rec:.3f}, MA={tv_rec_ma:.3f}, osc={tv_rec_osc:.3f})"
+                        f"[TV] Recommend SELL (all={tv_rec:.3f}, MA={tv_rec_ma:.3f}, osc={tv_rec_osc:.3f})"
                     )
 
-            # Signal 3: TradingView RSI extremes
+            # 2. RSI (wider range for paper)
             if not trade_direction:
-                if tv_rsi < 35:
+                if tv_rsi < 45:
                     trade_direction = "BUY"
-                    trade_confidence = 0.35 + (35 - tv_rsi) / 70
-                    trade_reasons.append(f"[TV-RSI] Oversold RSI={tv_rsi:.1f} → BUY")
-                elif tv_rsi > 65:
+                    trade_confidence = 0.3 + (45 - tv_rsi) / 90
+                    trade_reasons.append(f"[RSI] Oversold zone RSI={tv_rsi:.1f} → BUY")
+                elif tv_rsi > 55:
                     trade_direction = "SELL"
-                    trade_confidence = 0.35 + (tv_rsi - 65) / 70
-                    trade_reasons.append(f"[TV-RSI] Overbought RSI={tv_rsi:.1f} → SELL")
+                    trade_confidence = 0.3 + (tv_rsi - 55) / 90
+                    trade_reasons.append(f"[RSI] Overbought zone RSI={tv_rsi:.1f} → SELL")
 
-            # Signal 4: MACD crossover from TradingView
+            # 3. MACD
             if not trade_direction:
                 macd_diff = tv_macd - tv_macd_signal
-                if abs(macd_diff) > 10:
+                if macd_diff != 0:
                     trade_direction = "BUY" if macd_diff > 0 else "SELL"
-                    trade_confidence = min(0.3 + abs(macd_diff) / 200, 0.7)
+                    trade_confidence = min(0.3 + abs(macd_diff) / 500, 0.7)
                     trade_reasons.append(
-                        f"[TV-MACD] {'Bullish' if macd_diff > 0 else 'Bearish'} "
-                        f"MACD={tv_macd:.1f} vs Signal={tv_macd_signal:.1f}"
+                        f"[MACD] {'Bullish' if macd_diff > 0 else 'Bearish'} "
+                        f"(MACD={tv_macd:.1f}, Signal={tv_macd_signal:.1f})"
                     )
 
-            # Signal 5: Stochastic + Momentum combo
+            # 4. Momentum / price change
             if not trade_direction:
-                if tv_stoch_k < 25 and tv_momentum > 0:
+                if tv_change > 0:
                     trade_direction = "BUY"
-                    trade_confidence = 0.3
-                    trade_reasons.append(
-                        f"[TV-STOCH] Oversold StochK={tv_stoch_k:.0f} + positive mom → BUY"
-                    )
-                elif tv_stoch_k > 75 and tv_momentum < 0:
+                    trade_confidence = min(0.25 + abs(tv_change) * 10, 0.6)
+                    trade_reasons.append(f"[MOM] Positive momentum, change={tv_change:.3f}%")
+                elif tv_change < 0:
                     trade_direction = "SELL"
-                    trade_confidence = 0.3
-                    trade_reasons.append(
-                        f"[TV-STOCH] Overbought StochK={tv_stoch_k:.0f} + negative mom → SELL"
-                    )
+                    trade_confidence = min(0.25 + abs(tv_change) * 10, 0.6)
+                    trade_reasons.append(f"[MOM] Negative momentum, change={tv_change:.3f}%")
 
-            # Signal 6: Sentiment-driven (last resort)
-            if not trade_direction and abs(sentiment_result.get("score", 0)) > 0.3:
-                sent = sentiment_result["score"]
-                trade_direction = "BUY" if sent > 0 else "SELL"
-                trade_confidence = min(0.25 + abs(sent) * 0.3, 0.5)
+            # 5. GUARANTEED FALLBACK: if nothing else works, pick based on RSI vs 50
+            if not trade_direction:
+                trade_direction = "BUY" if tv_rsi <= 50 else "SELL"
+                trade_confidence = 0.2
                 trade_reasons.append(
-                    f"[SENTIMENT] {'Bullish' if sent > 0 else 'Bearish'} "
-                    f"news score={sent:.3f} → {trade_direction}"
+                    f"[FALLBACK] RSI={tv_rsi:.1f} {'<=' if tv_rsi <= 50 else '>'} 50 → {trade_direction}"
                 )
 
-            # Build the final signal for display
-            combined["reasons"] = trade_reasons
-            if trade_direction and trade_direction != combined.get("direction"):
-                combined["direction"] = trade_direction
-                combined["confidence"] = trade_confidence
+            logger.info(f"[PAPER] Decision: {trade_direction} conf={trade_confidence:.3f} reason={trade_reasons[-1]}")
 
-            self.last_signal = combined
-            result["signal"] = combined
+            # Build signal for display
+            combined_signal = {
+                "direction": trade_direction,
+                "confidence": round(trade_confidence, 4),
+                "combined_score": round(tv_rec, 4),
+                "strength": round(trade_confidence, 4),
+                "reasons": trade_reasons,
+                "scores": {
+                    "tv_recommendation": round(tv_rec, 4),
+                    "tv_rsi": round(tv_rsi, 2),
+                    "tv_macd": round(tv_macd, 2),
+                    "sentiment": round(sentiment_result.get("score", 0), 4),
+                },
+                "spot_ta": {"direction": trade_direction, "avg_signal": round(tv_rec, 4), "reasons": trade_reasons},
+                "sentiment": {"score": sentiment_result.get("score", 0), "tweet_count": sentiment_result.get("tweet_count", 0)},
+            }
+            self.last_signal = combined_signal
+            result["signal"] = combined_signal
 
             # Save snapshot
-            snapshot = MarketSnapshot(
-                market_id=market["id"],
-                yes_price=market.get("yes_price", 0),
-                no_price=market.get("no_price", 0),
-                volume=market.get("volume", 0),
-                liquidity=market.get("liquidity", 0),
-                sentiment_score=sentiment_result["score"],
-                technical_score=combined.get("combined_score", 0),
+            try:
+                db.add(MarketSnapshot(
+                    market_id=market["id"],
+                    yes_price=market.get("yes_price", 0),
+                    no_price=market.get("no_price", 0),
+                    volume=market.get("volume", 0),
+                    liquidity=market.get("liquidity", 0),
+                    sentiment_score=sentiment_result.get("score", 0),
+                    technical_score=tv_rec,
+                ))
+            except Exception:
+                pass
+
+            # 8. EXECUTE PAPER TRADE (guaranteed to happen)
+            trade_result = await self._execute_trade(
+                db, market,
+                {**combined_signal, "direction": trade_direction, "confidence": trade_confidence},
+                regime,
             )
-            db.add(snapshot)
+            result["trade"] = trade_result
+            logger.info(
+                f"[PAPER TRADE] {trade_direction} {trade_result.get('size', 0):.2f}"
+                f"@{trade_result.get('price', 0):.4f} | {trade_reasons[-1]}"
+            )
 
-            # 12. Execute paper trade
-            if trade_direction:
-                trade_result = await self._execute_trade(
-                    db, market,
-                    {**combined, "direction": trade_direction, "confidence": trade_confidence},
-                    regime,
-                )
-                result["trade"] = trade_result
-                logger.info(
-                    f"[PAPER] {trade_direction} trade placed! "
-                    f"conf={trade_confidence:.3f}, regime={regime['regime']}"
-                )
-            else:
-                result["status"] = "no_signal"
-                logger.info(
-                    f"[PAPER] No trade signal - regime={regime['regime']}, "
-                    f"combined={combined['direction']}, RSI={spot_signal.get('indicators', {}).get('rsi', 'N/A')}"
-                )
-
-            # 13. Check paper position exits
-            exit_check_price = poly_prices[-1] if poly_prices else market.get("yes_price", 0.5)
-            if exit_check_price > 0:
+            # 9. Check paper position exits
+            exit_price = poly_prices[-1] if poly_prices else market.get("yes_price", 0.5)
+            if exit_price > 0:
                 exits = self.paper_engine.check_exits(
-                    exit_check_price,
+                    exit_price,
                     stop_loss=settings.stop_loss_pct,
                     take_profit=settings.take_profit_pct,
                 )
@@ -437,23 +401,21 @@ class TradingEngine:
                         "volatility": regime.get("volatility", 0),
                         "regime": regime.get("regime", "UNKNOWN"),
                     })
-                    logger.info(
-                        f"[PAPER EXIT] {exit_pos['exit_reason']}: "
-                        f"P/L=${pnl:.2f} on {exit_pos.get('market_name', '')[:40]}"
-                    )
 
-            # 14. Auto-tune
-            if self.auto_tuner.can_tune() and self.auto_tuner.should_tune(self.risk_manager.pnl_history):
-                self.auto_tuner.adjust_threshold(increase=True)
-
-            # 15. Update bot state
+            # 10. Update bot state and COMMIT
             await self._update_bot_state(db)
             await db.commit()
+            logger.info("[PAPER] Cycle complete - trade committed to database")
 
         except Exception as e:
             logger.error(f"Paper trading cycle error: {e}", exc_info=True)
             result["status"] = "error"
             result["errors"].append(str(e))
+            # Try to commit whatever we have
+            try:
+                await db.commit()
+            except Exception:
+                await db.rollback()
 
         return result
 
