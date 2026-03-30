@@ -2,6 +2,9 @@
 Trading Engine - orchestrates the 5-minute BTC trading cycle.
 Uses regime-based adaptive strategy with dual-chart analysis.
 Supports paper and live trading modes.
+
+Paper mode is intentionally more aggressive to generate trades
+for algorithm testing. Live mode uses strict filters.
 """
 import logging
 from datetime import datetime, timedelta
@@ -44,7 +47,7 @@ class PaperTradingEngine:
         self.balance -= cost if side == "BUY" else 0
 
         position = {
-            "order_id": f"paper_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+            "order_id": f"paper_{datetime.utcnow().strftime('%Y%m%d%H%M%S_%f')}",
             "side": side,
             "entry_price": price,
             "size": size,
@@ -67,6 +70,8 @@ class PaperTradingEngine:
         """Check open positions for stop loss / take profit exits."""
         to_close = []
         for pos in self.positions:
+            if pos["entry_price"] == 0:
+                continue
             pnl_pct = (current_price - pos["entry_price"]) / pos["entry_price"]
             if pos["side"] == "SELL":
                 pnl_pct = -pnl_pct
@@ -128,6 +133,12 @@ class TradingEngine:
         self.paper_engine = PaperTradingEngine(settings.paper_starting_balance)
         self.trading_mode = settings.trading_mode  # "paper" or "live"
 
+        # Paper mode uses lower thresholds for active trading
+        self._paper_config = TradingConfig()
+        self._paper_config.threshold = 15       # $15 instead of $100
+        self._paper_config.min_threshold = 10
+        self._paper_config.max_threshold = 50
+
     def set_trading_mode(self, mode: str):
         if mode not in ("paper", "live"):
             raise ValueError("Mode must be 'paper' or 'live'")
@@ -136,14 +147,274 @@ class TradingEngine:
         logger.info(f"Trading mode switched: {old_mode} -> {mode.upper()}")
 
     async def run_cycle(self, db: AsyncSession) -> dict:
-        """Execute one full trading cycle using regime-based strategy."""
+        """Execute one full trading cycle."""
+        if self.trading_mode == "paper":
+            return await self._run_paper_cycle(db)
+        else:
+            return await self._run_live_cycle(db)
+
+    async def _run_paper_cycle(self, db: AsyncSession) -> dict:
+        """
+        Paper mode cycle - more aggressive, always tries to trade.
+        Uses lower thresholds and relaxed filters for algorithm testing.
+        """
         cycle_start = datetime.utcnow()
         self.auto_tuner.tick()
 
         result = {
             "timestamp": cycle_start.isoformat(),
             "status": "completed",
-            "trading_mode": self.trading_mode,
+            "trading_mode": "paper",
+            "synthetic_market": False,
+            "markets_scanned": 0,
+            "regime": None,
+            "signal": None,
+            "trade": None,
+            "risk": self.risk_manager.get_stats(),
+            "errors": [],
+        }
+
+        try:
+            # 0. Check cooldown (shorter in paper: 30 min instead of hours)
+            if self.risk_manager.in_cooldown():
+                result["status"] = "cooldown"
+                result["errors"].append(
+                    f"In cooldown until {self.risk_manager.cooldown_end.isoformat()}"
+                )
+                return result
+
+            # 1. Get BTC price data from TradingView
+            tv_data = await self.price_feed.get_tradingview_analysis(interval="5")
+            candles = await self.price_feed.get_5m_candles(limit=50)
+            spot_prices = self.price_feed.extract_prices(candles) if candles else []
+            spot_volumes = self.price_feed.extract_volumes(candles) if candles else []
+
+            if not spot_prices and tv_data.get("price"):
+                spot_prices = [tv_data["price"]] * 30
+
+            current_btc_price = spot_prices[-1] if spot_prices else tv_data.get("price", 0)
+
+            if current_btc_price == 0:
+                result["status"] = "error"
+                result["errors"].append("Could not fetch BTC price")
+                return result
+
+            # 2. Try real Polymarket markets, fall back to synthetic
+            markets = await self.polymarket.get_btc_markets()
+            result["markets_scanned"] = len(markets)
+            use_synthetic = False
+
+            if not markets:
+                use_synthetic = True
+                markets = [self._create_synthetic_market(current_btc_price)]
+                logger.info(f"Paper mode: synthetic market (BTC=${current_btc_price:.0f})")
+
+            result["synthetic_market"] = use_synthetic
+            market = self._select_best_market(markets)
+            self.selected_market = market
+            logger.info(f"Selected market: {market['question']}")
+
+            # 3. Polymarket odds data (synthetic if needed)
+            token_id = market.get("yes_token")
+            poly_prices = []
+
+            if not use_synthetic and token_id:
+                try:
+                    poly_history = await self.polymarket.get_price_history(token_id)
+                    poly_prices = [float(p.get("p", p.get("price", 0.5))) for p in poly_history if p]
+                except Exception:
+                    pass
+
+                if len(poly_prices) < 5:
+                    try:
+                        midpoint = await self.polymarket.get_midpoint(token_id)
+                        poly_prices = [midpoint or market.get("yes_price", 0.5)] * 30
+                    except Exception:
+                        pass
+
+            if len(poly_prices) < 5 and spot_prices:
+                poly_prices = self._derive_synthetic_odds(spot_prices)
+
+            # 4. Detect regime
+            regime = detect_regime(spot_prices) if len(spot_prices) >= 20 else {
+                "regime": "RANGE", "momentum": 0, "volatility": 0,
+                "direction": 0, "trend_efficiency": 0,
+            }
+            result["regime"] = regime
+
+            # 5. Regime decision (paper uses lower threshold)
+            current_price = spot_prices[-1] if spot_prices else current_btc_price
+            previous_price = spot_prices[-6] if len(spot_prices) >= 6 else current_price
+            regime_decision = make_regime_decision(
+                regime, current_price, previous_price, self._paper_config
+            )
+
+            # 6. TA signals
+            spot_signal = generate_technical_signal(spot_prices, volumes=spot_volumes, label="spot")
+            poly_signal = generate_technical_signal(poly_prices, label="polymarket")
+
+            # 7. Divergence
+            divergence = analyze_spot_vs_polymarket_divergence(spot_prices, poly_prices)
+
+            # 8. Sentiment
+            sentiment_result = await self.sentiment.analyze_btc_sentiment()
+            sent_log = SentimentLog(
+                source="cointelegraph", keyword="BTC",
+                score=sentiment_result["score"],
+                tweet_count=sentiment_result["tweet_count"],
+                bullish_count=sentiment_result["bullish"],
+                bearish_count=sentiment_result["bearish"],
+            )
+            db.add(sent_log)
+
+            # 9. Order book (skip for synthetic)
+            book_pressure = analyze_book_pressure({"buy_pressure": 0.5})
+            if token_id and not use_synthetic:
+                try:
+                    orderbook = await self.polymarket.get_orderbook(token_id)
+                    if orderbook.get("bids") and orderbook.get("asks"):
+                        bid_vol = sum(float(b.get("size", 0)) for b in orderbook["bids"][:10])
+                        ask_vol = sum(float(a.get("size", 0)) for a in orderbook["asks"][:10])
+                        total = bid_vol + ask_vol
+                        bp = bid_vol / total if total > 0 else 0.5
+                        book_pressure = analyze_book_pressure({"buy_pressure": bp})
+                except Exception:
+                    pass
+
+            # 10. Combine signals
+            combined = combine_dual_chart_signals(
+                spot_signal=spot_signal,
+                poly_signal=poly_signal,
+                divergence=divergence,
+                sentiment=sentiment_result,
+                book_pressure=book_pressure,
+            )
+
+            # 11. Paper mode: Use REGIME + TradingView recommendation as primary signal
+            #     This ensures the bot actually places trades for testing
+            trade_direction = None
+            trade_confidence = 0
+            trade_reasons = list(combined.get("reasons", []))
+
+            # First check: combined TA signal (if strong enough)
+            if combined["direction"] != "HOLD" and combined.get("confidence", 0) > 0.10:
+                trade_direction = combined["direction"]
+                trade_confidence = combined["confidence"]
+
+            # Second check: regime decision (lower threshold in paper)
+            elif regime_decision["action"] == "TRADE":
+                trade_direction = regime_decision["direction"]
+                trade_confidence = regime_decision["confidence"] * 0.7
+                trade_reasons.append(f"[PAPER-REGIME] {regime_decision['reason']}")
+
+            # Third check: TradingView's own recommendation
+            elif tv_data.get("recommend_all") is not None:
+                tv_rec = tv_data["recommend_all"]
+                if tv_rec > 0.2:
+                    trade_direction = "BUY"
+                    trade_confidence = min(abs(tv_rec), 0.8)
+                    trade_reasons.append(f"[TV-SIGNAL] TradingView says BUY (rec={tv_rec:.3f})")
+                elif tv_rec < -0.2:
+                    trade_direction = "SELL"
+                    trade_confidence = min(abs(tv_rec), 0.8)
+                    trade_reasons.append(f"[TV-SIGNAL] TradingView says SELL (rec={tv_rec:.3f})")
+
+            # Fourth check: pure RSI-based trade (paper mode only)
+            elif spot_signal.get("indicators", {}).get("rsi") is not None:
+                rsi = spot_signal["indicators"]["rsi"]
+                if rsi < 40:
+                    trade_direction = "BUY"
+                    trade_confidence = 0.3 + (40 - rsi) / 100
+                    trade_reasons.append(f"[PAPER-RSI] RSI oversold ({rsi:.1f}) → BUY")
+                elif rsi > 60:
+                    trade_direction = "SELL"
+                    trade_confidence = 0.3 + (rsi - 60) / 100
+                    trade_reasons.append(f"[PAPER-RSI] RSI overbought ({rsi:.1f}) → SELL")
+
+            # Build the final signal for display
+            combined["reasons"] = trade_reasons
+            if trade_direction and trade_direction != combined.get("direction"):
+                combined["direction"] = trade_direction
+                combined["confidence"] = trade_confidence
+
+            self.last_signal = combined
+            result["signal"] = combined
+
+            # Save snapshot
+            snapshot = MarketSnapshot(
+                market_id=market["id"],
+                yes_price=market.get("yes_price", 0),
+                no_price=market.get("no_price", 0),
+                volume=market.get("volume", 0),
+                liquidity=market.get("liquidity", 0),
+                sentiment_score=sentiment_result["score"],
+                technical_score=combined.get("combined_score", 0),
+            )
+            db.add(snapshot)
+
+            # 12. Execute paper trade
+            if trade_direction:
+                trade_result = await self._execute_trade(
+                    db, market,
+                    {**combined, "direction": trade_direction, "confidence": trade_confidence},
+                    regime,
+                )
+                result["trade"] = trade_result
+                logger.info(
+                    f"[PAPER] {trade_direction} trade placed! "
+                    f"conf={trade_confidence:.3f}, regime={regime['regime']}"
+                )
+            else:
+                result["status"] = "no_signal"
+                logger.info(
+                    f"[PAPER] No trade signal - regime={regime['regime']}, "
+                    f"combined={combined['direction']}, RSI={spot_signal.get('indicators', {}).get('rsi', 'N/A')}"
+                )
+
+            # 13. Check paper position exits
+            exit_check_price = poly_prices[-1] if poly_prices else market.get("yes_price", 0.5)
+            if exit_check_price > 0:
+                exits = self.paper_engine.check_exits(
+                    exit_check_price,
+                    stop_loss=settings.stop_loss_pct,
+                    take_profit=settings.take_profit_pct,
+                )
+                for exit_pos in exits:
+                    pnl = exit_pos.get("pnl", 0)
+                    self.risk_manager.update(pnl, {
+                        "momentum": regime.get("momentum", 0),
+                        "volatility": regime.get("volatility", 0),
+                        "regime": regime.get("regime", "UNKNOWN"),
+                    })
+                    logger.info(
+                        f"[PAPER EXIT] {exit_pos['exit_reason']}: "
+                        f"P/L=${pnl:.2f} on {exit_pos.get('market_name', '')[:40]}"
+                    )
+
+            # 14. Auto-tune
+            if self.auto_tuner.can_tune() and self.auto_tuner.should_tune(self.risk_manager.pnl_history):
+                self.auto_tuner.adjust_threshold(increase=True)
+
+            # 15. Update bot state
+            await self._update_bot_state(db)
+            await db.commit()
+
+        except Exception as e:
+            logger.error(f"Paper trading cycle error: {e}", exc_info=True)
+            result["status"] = "error"
+            result["errors"].append(str(e))
+
+        return result
+
+    async def _run_live_cycle(self, db: AsyncSession) -> dict:
+        """Live mode cycle - strict filters, real money at stake."""
+        cycle_start = datetime.utcnow()
+        self.auto_tuner.tick()
+
+        result = {
+            "timestamp": cycle_start.isoformat(),
+            "status": "completed",
+            "trading_mode": "live",
             "synthetic_market": False,
             "markets_scanned": 0,
             "regime": None,
@@ -162,7 +433,7 @@ class TradingEngine:
                 )
                 return result
 
-            # 1. Get BTC spot price data from TradingView FIRST (always works)
+            # 1. Get BTC price data
             tv_data = await self.price_feed.get_tradingview_analysis(interval="5")
             candles = await self.price_feed.get_5m_candles(limit=50)
             spot_prices = self.price_feed.extract_prices(candles) if candles else []
@@ -171,62 +442,46 @@ class TradingEngine:
             if not spot_prices and tv_data.get("price"):
                 spot_prices = [tv_data["price"]] * 30
 
-            current_btc_price = spot_prices[-1] if spot_prices else tv_data.get("price", 0)
-
-            # 2. Fetch BTC markets from Polymarket
+            # 2. Fetch real BTC markets (no synthetic in live mode)
             markets = await self.polymarket.get_btc_markets()
             result["markets_scanned"] = len(markets)
 
-            # In paper mode, create a synthetic market if none found
-            use_synthetic = False
-            if not markets and self.trading_mode == "paper" and current_btc_price > 0:
-                use_synthetic = True
-                markets = [self._create_synthetic_market(current_btc_price)]
-                logger.info(f"Paper mode: using synthetic BTC market (BTC=${current_btc_price:.0f})")
-
             if not markets:
                 result["status"] = "no_markets"
-                result["errors"].append("No active BTC markets found")
+                result["errors"].append("No active BTC markets found on Polymarket")
                 return result
 
-            result["synthetic_market"] = use_synthetic
             market = self._select_best_market(markets)
             self.selected_market = market
             logger.info(f"Selected market: {market['question']}")
 
-            # 3. Get Polymarket price data (or generate synthetic from BTC price)
+            # 3. Polymarket price data
             token_id = market.get("yes_token")
-            poly_prices = []
+            poly_history = await self.polymarket.get_price_history(token_id) if token_id else []
+            poly_prices = [float(p.get("p", p.get("price", 0.5))) for p in poly_history if p]
 
-            if not use_synthetic and token_id:
-                poly_history = await self.polymarket.get_price_history(token_id)
-                poly_prices = [float(p.get("p", p.get("price", 0.5))) for p in poly_history if p]
+            if len(poly_prices) < 5:
+                midpoint = await self.polymarket.get_midpoint(token_id) if token_id else None
+                poly_prices = [midpoint or market.get("yes_price", 0.5)] * 30
 
-                if len(poly_prices) < 5:
-                    midpoint = await self.polymarket.get_midpoint(token_id)
-                    poly_prices = [midpoint or market.get("yes_price", 0.5)] * 30
-
-            if len(poly_prices) < 5 and spot_prices:
-                # Derive synthetic odds from BTC price movement
-                poly_prices = self._derive_synthetic_odds(spot_prices)
-                logger.info(f"Using synthetic odds derived from BTC price ({len(poly_prices)} points)")
-
-            # 4. Detect market regime
+            # 4. Detect regime
             regime = detect_regime(spot_prices) if len(spot_prices) >= 20 else {
-                "regime": "UNKNOWN", "momentum": 0, "volatility": 0, "direction": 0
+                "regime": "UNKNOWN", "momentum": 0, "volatility": 0, "direction": 0,
             }
             result["regime"] = regime
 
-            # Check for bad conditions from risk manager
+            # Check bad conditions
             if self.risk_manager.is_bad_condition(regime["momentum"], regime["volatility"]):
                 result["status"] = "bad_conditions"
                 result["errors"].append("Skipping: conditions match previous losing pattern")
                 return result
 
-            # 5. Regime-based decision
+            # 5. Regime decision (strict threshold)
             current_price = spot_prices[-1] if spot_prices else tv_data.get("price", 0)
             previous_price = spot_prices[-6] if len(spot_prices) >= 6 else current_price
-            regime_decision = make_regime_decision(regime, current_price, previous_price, self.trading_config)
+            regime_decision = make_regime_decision(
+                regime, current_price, previous_price, self.trading_config
+            )
 
             if regime_decision["action"] == "SKIP":
                 result["status"] = "skipped"
@@ -234,14 +489,12 @@ class TradingEngine:
                 self.last_signal = regime_decision
                 return result
 
-            # 6. Dual-chart TA confirmation
+            # 6. Full TA pipeline
             spot_signal = generate_technical_signal(spot_prices, volumes=spot_volumes, label="spot")
             poly_signal = generate_technical_signal(poly_prices, label="polymarket")
-
-            # 7. Spot vs Polymarket divergence
             divergence = analyze_spot_vs_polymarket_divergence(spot_prices, poly_prices)
 
-            # 8. X sentiment
+            # 7. Sentiment
             sentiment_result = await self.sentiment.analyze_btc_sentiment()
             sent_log = SentimentLog(
                 source="cointelegraph", keyword="BTC",
@@ -252,10 +505,8 @@ class TradingEngine:
             )
             db.add(sent_log)
 
-            # 9. Order book pressure (skip API for synthetic markets)
-            orderbook = {}
-            if token_id and not use_synthetic:
-                orderbook = await self.polymarket.get_orderbook(token_id)
+            # 8. Order book
+            orderbook = await self.polymarket.get_orderbook(token_id) if token_id else {}
             book_data = {"buy_pressure": 0.5}
             if orderbook.get("bids") and orderbook.get("asks"):
                 bid_vol = sum(float(b.get("size", 0)) for b in orderbook["bids"][:10])
@@ -264,7 +515,7 @@ class TradingEngine:
                 book_data["buy_pressure"] = bid_vol / total if total > 0 else 0.5
             book_pressure = analyze_book_pressure(book_data)
 
-            # 10. Combine all signals
+            # 9. Combine
             combined = combine_dual_chart_signals(
                 spot_signal=spot_signal,
                 poly_signal=poly_signal,
@@ -273,13 +524,12 @@ class TradingEngine:
                 book_pressure=book_pressure,
             )
 
-            # Regime override: if regime is strong but TA says HOLD
+            # Regime override
             if regime_decision["confidence"] > 0.6 and combined["direction"] == "HOLD":
                 combined["direction"] = regime_decision["direction"]
                 combined["confidence"] = regime_decision["confidence"] * 0.8
                 combined["reasons"].append(f"[REGIME] Override: {regime_decision['reason']}")
 
-            # If combined disagrees with regime, reduce confidence
             if (combined["direction"] != "HOLD" and
                 regime_decision["direction"] != "NONE" and
                 combined["direction"] != regime_decision["direction"]):
@@ -301,8 +551,8 @@ class TradingEngine:
             )
             db.add(snapshot)
 
-            # 11. Execute trade if confident enough
-            min_confidence = 0.15 if self.trading_mode == "paper" else 0.25
+            # 10. Execute trade (strict confidence threshold)
+            min_confidence = 0.25
             if combined["direction"] != "HOLD" and combined.get("confidence", 0) > min_confidence:
                 trade_result = await self._execute_trade(db, market, combined, regime)
                 result["trade"] = trade_result
@@ -312,31 +562,16 @@ class TradingEngine:
                     f"conf={combined.get('confidence', 0):.3f}, regime={regime['regime']}"
                 )
 
-            # 12. Auto-tune
+            # 11. Auto-tune
             if self.auto_tuner.can_tune() and self.auto_tuner.should_tune(self.risk_manager.pnl_history):
                 self.auto_tuner.adjust_threshold(increase=True)
 
-            # 13. Paper position exit checks (use odds price for exits)
-            exit_check_price = market.get("yes_price", 0.5)
-            if self.trading_mode == "paper" and exit_check_price > 0:
-                exits = self.paper_engine.check_exits(
-                    exit_check_price,
-                    stop_loss=settings.stop_loss_pct,
-                    take_profit=settings.take_profit_pct,
-                )
-                for exit_pos in exits:
-                    self.risk_manager.update(exit_pos.get("pnl", 0), {
-                        "momentum": regime["momentum"],
-                        "volatility": regime["volatility"],
-                        "regime": regime["regime"],
-                    })
-
-            # 14. Update bot state
+            # 12. Update bot state
             await self._update_bot_state(db)
             await db.commit()
 
         except Exception as e:
-            logger.error(f"Trading cycle error: {e}", exc_info=True)
+            logger.error(f"Live trading cycle error: {e}", exc_info=True)
             result["status"] = "error"
             result["errors"].append(str(e))
 
@@ -384,11 +619,11 @@ class TradingEngine:
             total_cost=limit_price * size,
             order_id=order_result.get("order_id", ""),
             status=status,
-            strategy=f"regime_{regime['regime'].lower()}",
+            strategy=f"regime_{regime.get('regime', 'unknown').lower()}",
             signal_strength=confidence,
             notes=(
-                f"Mode: {self.trading_mode} | Regime: {regime['regime']} | "
-                f"Momentum: {regime['momentum']:.0f}bp | "
+                f"Mode: {self.trading_mode} | Regime: {regime.get('regime', '?')} | "
+                f"Momentum: {regime.get('momentum', 0):.0f}bp | "
                 f"Score: {signal.get('combined_score', 0):.3f}"
             ),
         )
@@ -396,7 +631,7 @@ class TradingEngine:
 
         logger.info(
             f"[{self.trading_mode.upper()}] {direction} {size:.2f}@{limit_price:.4f} "
-            f"on {market.get('question', '')[:50]} (regime={regime['regime']})"
+            f"on {market.get('question', '')[:50]} (regime={regime.get('regime', '?')})"
         )
 
         return {
@@ -408,15 +643,13 @@ class TradingEngine:
             "order_id": trade.order_id,
             "status": status,
             "market": market.get("question", ""),
-            "regime": regime["regime"],
+            "regime": regime.get("regime", "?"),
             "confidence": confidence,
         }
 
     @staticmethod
     def _create_synthetic_market(btc_price: float) -> dict:
-        """Create a synthetic BTC market for paper trading when Polymarket has none."""
-        # Simulate a "Will BTC be above $X at end of hour?" market
-        # yes_price derived from how close BTC is to a round number target
+        """Create a synthetic BTC market for paper trading."""
         round_target = round(btc_price / 1000) * 1000
         distance_pct = (btc_price - round_target) / round_target
         yes_price = max(0.10, min(0.90, 0.50 + distance_pct * 5))
@@ -438,10 +671,7 @@ class TradingEngine:
 
     @staticmethod
     def _derive_synthetic_odds(spot_prices: list[float]) -> list[float]:
-        """
-        Convert BTC spot prices into synthetic Polymarket-style odds (0-1).
-        Maps price position within recent range to a probability.
-        """
+        """Convert BTC spot prices into synthetic odds (0-1)."""
         if len(spot_prices) < 5:
             return [0.5] * 30
 
@@ -452,13 +682,11 @@ class TradingEngine:
         if price_range == 0:
             return [0.5] * len(spot_prices)
 
-        # Normalize prices to 0.20-0.80 range (typical odds range)
         odds = []
         for p in spot_prices:
-            normalized = (p - min_p) / price_range  # 0 to 1
-            odd = 0.20 + normalized * 0.60  # 0.20 to 0.80
+            normalized = (p - min_p) / price_range
+            odd = 0.20 + normalized * 0.60
             odds.append(round(odd, 4))
-
         return odds
 
     def _select_best_market(self, markets: list[dict]) -> dict:
