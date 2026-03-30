@@ -249,7 +249,7 @@ async def get_settings():
         "has_private_key": bool(settings.polymarket_private_key),
         "polymarket_live_ready": polymarket_client.is_live_ready if polymarket_client else False,
         "polymarket_funder": settings.polymarket_funder or "",
-        "has_x_token": bool(settings.x_bearer_token),
+        "sentiment_source": "cointelegraph",
         "paper_starting_balance": settings.paper_starting_balance,
     }
 

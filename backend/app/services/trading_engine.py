@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 
 from .polymarket_client import PolymarketClient
-from .x_sentiment import XSentimentAnalyzer
+from .cointelegraph_sentiment import CoinTelegraphSentiment
 from .btc_price_feed import BTCPriceFeed
 from ..strategies.regime import (
     TradingConfig, detect_regime, RiskManager, AutoTuner, make_regime_decision,
@@ -110,7 +110,7 @@ class PaperTradingEngine:
 
 
 class TradingEngine:
-    def __init__(self, polymarket: PolymarketClient, sentiment: XSentimentAnalyzer,
+    def __init__(self, polymarket: PolymarketClient, sentiment: CoinTelegraphSentiment,
                  price_feed: BTCPriceFeed = None):
         self.polymarket = polymarket
         self.sentiment = sentiment
@@ -244,7 +244,7 @@ class TradingEngine:
             # 8. X sentiment
             sentiment_result = await self.sentiment.analyze_btc_sentiment()
             sent_log = SentimentLog(
-                source="twitter", keyword="BTC",
+                source="cointelegraph", keyword="BTC",
                 score=sentiment_result["score"],
                 tweet_count=sentiment_result["tweet_count"],
                 bullish_count=sentiment_result["bullish"],

@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from .core.config import settings
 from .core.database import init_db
 from .services.polymarket_client import PolymarketClient
-from .services.x_sentiment import XSentimentAnalyzer
+from .services.cointelegraph_sentiment import CoinTelegraphSentiment
 from .services.btc_price_feed import BTCPriceFeed
 from .services.trading_engine import TradingEngine
 from .services.bot_runner import BotRunner
@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
         funder=settings.polymarket_funder,
         private_key=settings.polymarket_private_key,
     )
-    sentiment_analyzer = XSentimentAnalyzer(bearer_token=settings.x_bearer_token)
+    sentiment_analyzer = CoinTelegraphSentiment()
     price_feed = BTCPriceFeed()
     trading_engine = TradingEngine(polymarket_client, sentiment_analyzer, price_feed)
     bot_runner_instance = BotRunner(trading_engine)
@@ -69,7 +69,7 @@ async def lifespan(app: FastAPI):
     logger.info("All services initialized")
     logger.info(f"Trading Mode: {settings.trading_mode.upper()}")
     logger.info(f"Polymarket API: {'LIVE READY' if polymarket_client.is_live_ready else 'configured (key only)' if settings.polymarket_private_key else 'PAPER MODE'}")
-    logger.info(f"X Sentiment: {'configured' if settings.x_bearer_token else 'disabled (no token)'}")
+    logger.info("Sentiment: CoinTelegraph RSS (no API key needed)")
 
     yield
 
@@ -84,7 +84,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Polymarket BTC Trading Bot",
-    description="Automated BTC prediction market trader with X sentiment analysis",
+    description="Automated BTC prediction market trader with CoinTelegraph sentiment",
     version="1.0.0",
     lifespan=lifespan,
 )

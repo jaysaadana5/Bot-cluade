@@ -8,10 +8,10 @@ function SentimentPanel({ sentiment, history = [] }) {
   return (
     <div className="card">
       <div className="card-header">
-        <span className="card-title">X (Twitter) Sentiment</span>
+        <span className="card-title">CoinTelegraph Sentiment</span>
         {sentiment?.tweet_count > 0 && (
           <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-            {sentiment.tweet_count} tweets analyzed
+            {sentiment.tweet_count} articles analyzed
           </span>
         )}
       </div>
@@ -74,11 +74,11 @@ function SentimentPanel({ sentiment, history = [] }) {
         </div>
       )}
 
-      {/* Top Tweets */}
+      {/* Top Headlines */}
       {sentiment?.top_tweets?.length > 0 && (
         <div style={{ marginTop: '1rem' }}>
-          <div className="stat-label" style={{ marginBottom: '0.5rem' }}>Top Tweets</div>
-          {sentiment.top_tweets.slice(0, 3).map((tweet, i) => (
+          <div className="stat-label" style={{ marginBottom: '0.5rem' }}>Top Headlines</div>
+          {sentiment.top_tweets.slice(0, 3).map((article, i) => (
             <div key={i} style={{
               padding: '0.5rem',
               background: 'var(--bg-primary)',
@@ -87,10 +87,10 @@ function SentimentPanel({ sentiment, history = [] }) {
               fontSize: '0.8rem',
               color: 'var(--text-secondary)',
             }}>
-              <span className={tweet.sentiment === 'bullish' ? 'positive' : tweet.sentiment === 'bearish' ? 'negative' : ''}>
-                [{tweet.sentiment}]
+              <span className={article.sentiment === 'bullish' ? 'positive' : article.sentiment === 'bearish' ? 'negative' : ''}>
+                [{article.sentiment}]
               </span>{' '}
-              {tweet.text?.substring(0, 120)}...
+              {article.text?.substring(0, 120)}{article.text?.length > 120 ? '...' : ''}
             </div>
           ))}
         </div>

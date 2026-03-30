@@ -75,7 +75,7 @@ function SettingsPanel({ settings, tradingMode, onModeChange, onNotify }) {
     { label: 'Risk Per Trade', value: `${(settings.risk_per_trade * 100).toFixed(1)}%` },
     { label: 'Stop Loss', value: `${(settings.stop_loss_pct * 100).toFixed(1)}%` },
     { label: 'Take Profit', value: `${(settings.take_profit_pct * 100).toFixed(1)}%` },
-    { label: 'X Sentiment', value: settings.has_x_token ? 'Connected' : 'Disabled', status: settings.has_x_token },
+    { label: 'Sentiment', value: 'CoinTelegraph RSS', status: true },
   ];
 
   return (

@@ -10,11 +10,6 @@ class Settings(BaseSettings):
     polymarket_funder: str = ""
     polymarket_private_key: str = ""
 
-    # X (Twitter)
-    x_bearer_token: str = ""
-    x_api_key: str = ""
-    x_api_secret: str = ""
-
     # Trading
     trading_mode: str = "paper"  # "paper" or "live"
     bot_interval_seconds: int = 300
