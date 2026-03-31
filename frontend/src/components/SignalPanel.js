@@ -71,76 +71,72 @@ function SignalPanel({ signal }) {
         </div>
       </div>
 
+      {/* Polymarket Odds */}
+      {signal.polymarket && (
+        <div style={{
+          padding: '0.75rem',
+          background: 'var(--bg-primary)',
+          borderRadius: '8px',
+          marginBottom: '1rem',
+        }}>
+          <div className="stat-label" style={{ marginBottom: '0.5rem' }}>Polymarket Odds</div>
+          <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap', fontSize: '0.9rem' }}>
+            <div>
+              <span style={{ color: 'var(--text-muted)' }}>YES (UP): </span>
+              <span className="mono" style={{ fontWeight: 700, color: 'var(--green)' }}>
+                {(signal.polymarket.yes_price * 100).toFixed(1)}%
+              </span>
+            </div>
+            <div>
+              <span style={{ color: 'var(--text-muted)' }}>NO (DOWN): </span>
+              <span className="mono" style={{ fontWeight: 700, color: 'var(--red)' }}>
+                {(signal.polymarket.no_price * 100).toFixed(1)}%
+              </span>
+            </div>
+            {signal.polymarket.buy_pressure != null && (
+              <div>
+                <span style={{ color: 'var(--text-muted)' }}>Buy Pressure: </span>
+                <span className="mono" style={{ fontWeight: 600 }}>
+                  {(signal.polymarket.buy_pressure * 100).toFixed(0)}%
+                </span>
+              </div>
+            )}
+          </div>
+          {signal.polymarket.market && (
+            <div style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+              Market: {signal.polymarket.market}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Scores */}
       <div style={{ display: 'flex', gap: '1rem', marginBottom: '1rem', flexWrap: 'wrap' }}>
-        {combinedScore !== 0 && (
+        {scores.polymarket_yes !== undefined && (
           <div>
-            <div className="stat-label">Combined</div>
-            <div className="mono" style={{ fontWeight: 600 }}>{combinedScore.toFixed(3)}</div>
+            <div className="stat-label">YES Price</div>
+            <div className="mono" style={{ fontWeight: 600, color: 'var(--green)' }}>{(scores.polymarket_yes * 100).toFixed(1)}%</div>
           </div>
         )}
-        {scores.spot_ta !== undefined && (
+        {scores.polymarket_no !== undefined && (
           <div>
-            <div className="stat-label">Spot TA</div>
-            <div className="mono" style={{ fontWeight: 600 }}>{scores.spot_ta.toFixed(3)}</div>
+            <div className="stat-label">NO Price</div>
+            <div className="mono" style={{ fontWeight: 600, color: 'var(--red)' }}>{(scores.polymarket_no * 100).toFixed(1)}%</div>
           </div>
         )}
-        {scores.divergence !== undefined && (
+        {scores.spread !== undefined && scores.spread > 0 && (
           <div>
-            <div className="stat-label">Divergence</div>
-            <div className="mono" style={{ fontWeight: 600 }}>{scores.divergence.toFixed(3)}</div>
+            <div className="stat-label">Spread</div>
+            <div className="mono" style={{ fontWeight: 600 }}>{(scores.spread * 100).toFixed(2)}%</div>
           </div>
         )}
-        {scores.sentiment !== undefined && (
+        {scores.buy_pressure !== undefined && (
           <div>
-            <div className="stat-label">Sentiment</div>
-            <div className="mono" style={{ fontWeight: 600 }}>{scores.sentiment.toFixed(3)}</div>
-          </div>
-        )}
-        {/* Fallback for old format */}
-        {signal.tech_score !== undefined && (
-          <div>
-            <div className="stat-label">Tech</div>
-            <div className="mono" style={{ fontWeight: 600 }}>{signal.tech_score.toFixed(3)}</div>
-          </div>
-        )}
-        {signal.sent_score !== undefined && (
-          <div>
-            <div className="stat-label">Sent</div>
-            <div className="mono" style={{ fontWeight: 600 }}>{signal.sent_score.toFixed(3)}</div>
+            <div className="stat-label">Book Pressure</div>
+            <div className="mono" style={{ fontWeight: 600 }}>{(scores.buy_pressure * 100).toFixed(0)}%</div>
           </div>
         )}
       </div>
-
-      {/* Regime info if available */}
-      {signal.reason && (
-        <div style={{
-          padding: '0.5rem 0.75rem',
-          background: 'var(--bg-primary)',
-          borderRadius: '6px',
-          fontSize: '0.8rem',
-          color: 'var(--text-secondary)',
-          marginBottom: '0.75rem',
-        }}>
-          {signal.reason}
-        </div>
-      )}
-
-      {/* Indicators */}
-      {indicators.rsi != null && (
-        <div style={{ marginBottom: '0.5rem' }}>
-          <div className="stat-label">Indicators</div>
-          <div style={{ display: 'flex', gap: '1rem', marginTop: '0.25rem', fontSize: '0.85rem', flexWrap: 'wrap' }}>
-            <span className="mono">RSI: <strong>{indicators.rsi}</strong></span>
-            {indicators.macd && (
-              <span className="mono">MACD: <strong>{indicators.macd.histogram?.toFixed(4)}</strong></span>
-            )}
-            {indicators.bollinger_pct_b != null && (
-              <span className="mono">BB%: <strong>{(indicators.bollinger_pct_b * 100).toFixed(1)}%</strong></span>
-            )}
-          </div>
-        </div>
-      )}
 
       {/* Reasons */}
       {reasons.length > 0 && (

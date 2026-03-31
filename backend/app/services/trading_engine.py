@@ -155,8 +155,9 @@ class TradingEngine:
 
     async def _run_paper_cycle(self, db: AsyncSession) -> dict:
         """
-        Paper mode cycle - ALWAYS places a trade every cycle for testing.
-        Uses TradingView pre-computed indicators as primary signal source.
+        Paper mode cycle - trades on Polymarket BTC 5min UP/DOWN market.
+        Decisions based on Polymarket odds movement, NOT TradingView.
+        Executes at 3:30 mark (1:30 before 5-min close).
         """
         cycle_start = datetime.utcnow()
         self.auto_tuner.tick()
@@ -165,7 +166,7 @@ class TradingEngine:
             "timestamp": cycle_start.isoformat(),
             "status": "completed",
             "trading_mode": "paper",
-            "synthetic_market": False,
+            "polymarket_market": None,
             "markets_scanned": 0,
             "regime": None,
             "signal": None,
@@ -175,204 +176,249 @@ class TradingEngine:
         }
 
         try:
-            # 0. Skip cooldown in paper mode - we always want to see trades
-            # (cooldown only matters for live)
-
-            # 1. Get BTC data from TradingView scanner (always works)
-            tv_data = {}
+            # 1. Find active BTC 5min market on Polymarket
+            poly_market = None
             try:
-                tv_data = await self.price_feed.get_tradingview_analysis(interval="5") or {}
+                poly_market = await self.polymarket.get_btc_5min_market()
             except Exception as e:
-                logger.warning(f"TradingView scanner failed: {e}")
+                logger.warning(f"Polymarket BTC 5min search failed: {e}")
 
-            # 2. Get candle data from Binance (always works, no key needed)
-            candles = []
-            spot_prices = []
-            spot_volumes = []
-            try:
-                candles = await self.price_feed.get_5m_candles(limit=50) or []
-                spot_prices = self.price_feed.extract_prices(candles) if candles else []
-                spot_volumes = self.price_feed.extract_volumes(candles) if candles else []
-            except Exception as e:
-                logger.warning(f"Candle fetch failed: {e}")
-
-            # Determine BTC price from best available source
+            # 2. Get BTC spot price (for reference & P&L)
             current_btc_price = 0
-            if spot_prices:
-                current_btc_price = spot_prices[-1]
-            elif tv_data.get("price"):
-                current_btc_price = tv_data["price"]
-                # Build minimal price series from scanner snapshot
-                spot_prices = [current_btc_price] * 30
+            try:
+                candles = await self.price_feed.get_5m_candles(limit=20) or []
+                if candles:
+                    current_btc_price = candles[-1]["close"]
+            except Exception as e:
+                logger.warning(f"Binance price fetch failed: {e}")
+
+            if current_btc_price == 0:
+                try:
+                    tv_data = await self.price_feed.get_tradingview_analysis(interval="5") or {}
+                    current_btc_price = tv_data.get("price", 0)
+                except Exception:
+                    pass
 
             if current_btc_price == 0:
                 result["status"] = "error"
-                result["errors"].append("Could not fetch BTC price from any source")
-                logger.error("[PAPER] No BTC price available from TradingView or Binance")
+                result["errors"].append("Could not fetch BTC price")
                 return result
 
-            logger.info(f"[PAPER] BTC=${current_btc_price:.2f}, candles={len(candles)}")
+            # 3. Get Polymarket market data for decision making
+            trade_direction = None
+            trade_confidence = 0
+            trade_reasons = []
+            yes_price = 0.50
+            no_price = 0.50
+            poly_data = {}
 
-            # 3. Paper mode: ALWAYS use BTC 5min UP/DOWN market (no Polymarket search)
-            market = self._create_synthetic_market(current_btc_price)
-            self.selected_market = market
-            result["synthetic_market"] = True
-            result["markets_scanned"] = 0
+            if poly_market and poly_market.get("yes_token"):
+                # Use REAL Polymarket data
+                result["polymarket_market"] = poly_market["question"]
 
-            # 4. Poly prices (synthetic from spot data)
-            poly_prices = self._derive_synthetic_odds(spot_prices) if spot_prices else [0.5] * 30
+                try:
+                    poly_data = await self.polymarket.get_market_prices_realtime(
+                        poly_market["yes_token"]
+                    )
+                    yes_price = poly_data.get("yes_price", 0.50)
+                    no_price = poly_data.get("no_price", 0.50)
+                    poly_market["yes_price"] = yes_price
+                    poly_market["no_price"] = no_price
+                except Exception as e:
+                    logger.warning(f"Polymarket price fetch failed: {e}")
 
-            # 5. Detect regime
+                # Get price history to see trend
+                price_history = []
+                try:
+                    price_history = await self.polymarket.get_price_history(
+                        poly_market["yes_token"], fidelity=1
+                    )
+                except Exception as e:
+                    logger.warning(f"Polymarket history fetch failed: {e}")
+
+                logger.info(
+                    f"[POLY] Market: {poly_market['question']} | "
+                    f"YES={yes_price:.3f} NO={no_price:.3f} | "
+                    f"History points: {len(price_history)}"
+                )
+
+                # --- Decision based on Polymarket data ---
+
+                buy_pressure = poly_data.get("buy_pressure", 0.5)
+                spread = poly_data.get("spread", 0)
+                bid_vol = poly_data.get("bid_volume", 0)
+                ask_vol = poly_data.get("ask_volume", 0)
+
+                # Signal 1: YES price level (market consensus)
+                if yes_price > 0.60:
+                    trade_direction = "BUY"
+                    trade_confidence = 0.3 + (yes_price - 0.50) * 1.5
+                    trade_reasons.append(
+                        f"[POLY] Market bullish YES={yes_price:.3f} (>{0.60}) → BUY"
+                    )
+                elif yes_price < 0.40:
+                    trade_direction = "SELL"
+                    trade_confidence = 0.3 + (0.50 - yes_price) * 1.5
+                    trade_reasons.append(
+                        f"[POLY] Market bearish YES={yes_price:.3f} (<{0.40}) → SELL"
+                    )
+
+                # Signal 2: Order book pressure
+                if not trade_direction and buy_pressure != 0.5:
+                    if buy_pressure > 0.60:
+                        trade_direction = "BUY"
+                        trade_confidence = 0.25 + (buy_pressure - 0.50) * 1.2
+                        trade_reasons.append(
+                            f"[BOOK] Buy pressure {buy_pressure:.0%} (bids={bid_vol:.0f} asks={ask_vol:.0f}) → BUY"
+                        )
+                    elif buy_pressure < 0.40:
+                        trade_direction = "SELL"
+                        trade_confidence = 0.25 + (0.50 - buy_pressure) * 1.2
+                        trade_reasons.append(
+                            f"[BOOK] Sell pressure {buy_pressure:.0%} (bids={bid_vol:.0f} asks={ask_vol:.0f}) → SELL"
+                        )
+
+                # Signal 3: Price history trend (if we have enough data)
+                if not trade_direction and len(price_history) >= 3:
+                    recent_prices = [float(p.get("p", p.get("price", 0.5))) for p in price_history[-5:]]
+                    if len(recent_prices) >= 2:
+                        price_trend = recent_prices[-1] - recent_prices[0]
+                        if price_trend > 0.02:
+                            trade_direction = "BUY"
+                            trade_confidence = min(0.3 + abs(price_trend) * 5, 0.8)
+                            trade_reasons.append(
+                                f"[TREND] YES price rising {recent_prices[0]:.3f}→{recent_prices[-1]:.3f} → BUY"
+                            )
+                        elif price_trend < -0.02:
+                            trade_direction = "SELL"
+                            trade_confidence = min(0.3 + abs(price_trend) * 5, 0.8)
+                            trade_reasons.append(
+                                f"[TREND] YES price falling {recent_prices[0]:.3f}→{recent_prices[-1]:.3f} → SELL"
+                            )
+
+                # Signal 4: Tight spread + lean = high confidence follow
+                if not trade_direction and spread < 0.05 and yes_price != 0.50:
+                    if yes_price > 0.52:
+                        trade_direction = "BUY"
+                        trade_confidence = 0.25
+                        trade_reasons.append(
+                            f"[SPREAD] Tight spread={spread:.3f}, YES leaning up {yes_price:.3f} → BUY"
+                        )
+                    elif yes_price < 0.48:
+                        trade_direction = "SELL"
+                        trade_confidence = 0.25
+                        trade_reasons.append(
+                            f"[SPREAD] Tight spread={spread:.3f}, YES leaning down {yes_price:.3f} → SELL"
+                        )
+
+                self.selected_market = poly_market
+
+            else:
+                # No Polymarket market found - use synthetic with BTC spot data
+                logger.warning("[POLY] No BTC 5min market found on Polymarket, using synthetic")
+                poly_market = self._create_synthetic_market(current_btc_price)
+                self.selected_market = poly_market
+                result["polymarket_market"] = "BTC 5min UP/DOWN (synthetic)"
+
+                # Fall back to BTC spot price movement for direction
+                try:
+                    candles = await self.price_feed.get_5m_candles(limit=10) or []
+                    if len(candles) >= 2:
+                        price_5min_ago = candles[-2]["close"]
+                        price_change = current_btc_price - price_5min_ago
+                        pct_change = price_change / price_5min_ago if price_5min_ago > 0 else 0
+
+                        if pct_change > 0.0005:
+                            trade_direction = "BUY"
+                            trade_confidence = min(0.3 + abs(pct_change) * 100, 0.8)
+                            trade_reasons.append(
+                                f"[SPOT] BTC up {pct_change:.3%} in 5min → BUY"
+                            )
+                        elif pct_change < -0.0005:
+                            trade_direction = "SELL"
+                            trade_confidence = min(0.3 + abs(pct_change) * 100, 0.8)
+                            trade_reasons.append(
+                                f"[SPOT] BTC down {pct_change:.3%} in 5min → SELL"
+                            )
+                except Exception as e:
+                    logger.warning(f"Spot fallback error: {e}")
+
+            # 4. Guaranteed fallback: if no signal yet, use YES price vs 0.50
+            if not trade_direction:
+                if yes_price >= 0.50:
+                    trade_direction = "BUY"
+                else:
+                    trade_direction = "SELL"
+                trade_confidence = 0.2
+                trade_reasons.append(
+                    f"[FALLBACK] YES={yes_price:.3f} {'≥' if yes_price >= 0.50 else '<'} 0.50 → {trade_direction}"
+                )
+
+            trade_confidence = min(trade_confidence, 0.95)
+
+            logger.info(
+                f"[PAPER] Decision: {trade_direction} conf={trade_confidence:.3f} | "
+                f"YES={yes_price:.3f} NO={no_price:.3f} | {trade_reasons[-1]}"
+            )
+
+            # Build signal for display
+            combined_signal = {
+                "direction": trade_direction,
+                "confidence": round(trade_confidence, 4),
+                "combined_score": round(yes_price - 0.50, 4),
+                "strength": round(trade_confidence, 4),
+                "reasons": trade_reasons,
+                "scores": {
+                    "polymarket_yes": round(yes_price, 4),
+                    "polymarket_no": round(no_price, 4),
+                    "buy_pressure": round(poly_data.get("buy_pressure", 0.5), 4),
+                    "spread": round(poly_data.get("spread", 0), 4),
+                },
+                "polymarket": {
+                    "yes_price": yes_price,
+                    "no_price": no_price,
+                    "buy_pressure": poly_data.get("buy_pressure", 0.5),
+                    "market": poly_market.get("question", "BTC 5min") if poly_market else "N/A",
+                },
+            }
+            self.last_signal = combined_signal
+            result["signal"] = combined_signal
+
+            # Detect regime from spot prices (for reference)
+            spot_prices = []
+            try:
+                candles = await self.price_feed.get_5m_candles(limit=25) or []
+                spot_prices = [c["close"] for c in candles]
+            except Exception:
+                pass
             regime = detect_regime(spot_prices) if len(spot_prices) >= 20 else {
                 "regime": "RANGE", "momentum": 0, "volatility": 0,
                 "direction": 0, "trend_efficiency": 0,
             }
             result["regime"] = regime
 
-            # 6. Sentiment (non-blocking)
-            sentiment_result = {"score": 0, "tweet_count": 0, "bullish": 0, "bearish": 0, "confidence": 0}
-            try:
-                sentiment_result = await self.sentiment.analyze_btc_sentiment()
-            except Exception as e:
-                logger.warning(f"Sentiment fetch failed: {e}")
-
-            try:
-                db.add(SentimentLog(
-                    source="cointelegraph", keyword="BTC",
-                    score=sentiment_result.get("score", 0),
-                    tweet_count=sentiment_result.get("tweet_count", 0),
-                    bullish_count=sentiment_result.get("bullish", 0),
-                    bearish_count=sentiment_result.get("bearish", 0),
-                ))
-            except Exception:
-                pass
-
-            # 7. Determine trade direction using TradingView's PRE-COMPUTED indicators
-            #    These are calculated by TradingView from ALL their indicators - always reliable
-            tv_rec = tv_data.get("recommend_all") or 0
-            tv_rsi = tv_data.get("rsi") or 50
-            tv_macd = tv_data.get("macd") or 0
-            tv_macd_signal = tv_data.get("macd_signal") or 0
-            tv_rec_ma = tv_data.get("recommend_ma") or 0
-            tv_rec_osc = tv_data.get("recommend_oscillators") or 0
-            tv_momentum = tv_data.get("momentum") or 0
-            tv_stoch_k = tv_data.get("stoch_k") or 50
-            tv_change = tv_data.get("change") or 0
-
-            logger.info(
-                f"[PAPER] TV: rec={tv_rec:.3f} rsi={tv_rsi:.1f} macd={tv_macd:.1f} "
-                f"stoch={tv_stoch_k:.1f} mom={tv_momentum:.1f} chg={tv_change:.3f}%"
-            )
-
-            trade_direction = None
-            trade_confidence = 0
-            trade_reasons = []
-
-            # --- Signal cascade: try each until one triggers ---
-
-            # 1. TV recommendation (works even at low values for paper mode)
-            if not trade_direction and tv_rec != 0:
-                if tv_rec > 0.05:
-                    trade_direction = "BUY"
-                    trade_confidence = min(0.3 + abs(tv_rec), 0.9)
-                    trade_reasons.append(
-                        f"[TV] Recommend BUY (all={tv_rec:.3f}, MA={tv_rec_ma:.3f}, osc={tv_rec_osc:.3f})"
-                    )
-                elif tv_rec < -0.05:
-                    trade_direction = "SELL"
-                    trade_confidence = min(0.3 + abs(tv_rec), 0.9)
-                    trade_reasons.append(
-                        f"[TV] Recommend SELL (all={tv_rec:.3f}, MA={tv_rec_ma:.3f}, osc={tv_rec_osc:.3f})"
-                    )
-
-            # 2. RSI (wider range for paper)
-            if not trade_direction:
-                if tv_rsi < 45:
-                    trade_direction = "BUY"
-                    trade_confidence = 0.3 + (45 - tv_rsi) / 90
-                    trade_reasons.append(f"[RSI] Oversold zone RSI={tv_rsi:.1f} → BUY")
-                elif tv_rsi > 55:
-                    trade_direction = "SELL"
-                    trade_confidence = 0.3 + (tv_rsi - 55) / 90
-                    trade_reasons.append(f"[RSI] Overbought zone RSI={tv_rsi:.1f} → SELL")
-
-            # 3. MACD
-            if not trade_direction:
-                macd_diff = tv_macd - tv_macd_signal
-                if macd_diff != 0:
-                    trade_direction = "BUY" if macd_diff > 0 else "SELL"
-                    trade_confidence = min(0.3 + abs(macd_diff) / 500, 0.7)
-                    trade_reasons.append(
-                        f"[MACD] {'Bullish' if macd_diff > 0 else 'Bearish'} "
-                        f"(MACD={tv_macd:.1f}, Signal={tv_macd_signal:.1f})"
-                    )
-
-            # 4. Momentum / price change
-            if not trade_direction:
-                if tv_change > 0:
-                    trade_direction = "BUY"
-                    trade_confidence = min(0.25 + abs(tv_change) * 10, 0.6)
-                    trade_reasons.append(f"[MOM] Positive momentum, change={tv_change:.3f}%")
-                elif tv_change < 0:
-                    trade_direction = "SELL"
-                    trade_confidence = min(0.25 + abs(tv_change) * 10, 0.6)
-                    trade_reasons.append(f"[MOM] Negative momentum, change={tv_change:.3f}%")
-
-            # 5. GUARANTEED FALLBACK: if nothing else works, pick based on RSI vs 50
-            if not trade_direction:
-                trade_direction = "BUY" if tv_rsi <= 50 else "SELL"
-                trade_confidence = 0.2
-                trade_reasons.append(
-                    f"[FALLBACK] RSI={tv_rsi:.1f} {'<=' if tv_rsi <= 50 else '>'} 50 → {trade_direction}"
-                )
-
-            logger.info(f"[PAPER] Decision: {trade_direction} conf={trade_confidence:.3f} reason={trade_reasons[-1]}")
-
-            # Build signal for display
-            combined_signal = {
-                "direction": trade_direction,
-                "confidence": round(trade_confidence, 4),
-                "combined_score": round(tv_rec, 4),
-                "strength": round(trade_confidence, 4),
-                "reasons": trade_reasons,
-                "scores": {
-                    "tv_recommendation": round(tv_rec, 4),
-                    "tv_rsi": round(tv_rsi, 2),
-                    "tv_macd": round(tv_macd, 2),
-                    "sentiment": round(sentiment_result.get("score", 0), 4),
-                },
-                "spot_ta": {"direction": trade_direction, "avg_signal": round(tv_rec, 4), "reasons": trade_reasons},
-                "sentiment": {"score": sentiment_result.get("score", 0), "tweet_count": sentiment_result.get("tweet_count", 0)},
-            }
-            self.last_signal = combined_signal
-            result["signal"] = combined_signal
-
             # Save snapshot
             try:
                 db.add(MarketSnapshot(
-                    market_id=market["id"],
-                    yes_price=market.get("yes_price", 0),
-                    no_price=market.get("no_price", 0),
-                    volume=market.get("volume", 0),
-                    liquidity=market.get("liquidity", 0),
-                    sentiment_score=sentiment_result.get("score", 0),
-                    technical_score=tv_rec,
+                    market_id=poly_market.get("id", "btc_5min"),
+                    yes_price=yes_price,
+                    no_price=no_price,
+                    volume=poly_market.get("volume", 0),
+                    liquidity=poly_market.get("liquidity", 0),
+                    sentiment_score=0,
+                    technical_score=yes_price - 0.50,
                 ))
             except Exception:
                 pass
 
-            # 8. SETTLE PREVIOUS PAPER TRADES - calculate P&L from BTC price change
+            # 5. SETTLE PREVIOUS PAPER TRADES
             try:
                 unsettled = await db.execute(
-                    select(Trade).where(
-                        Trade.status == "paper_filled",
-                    )
+                    select(Trade).where(Trade.status == "paper_filled")
                 )
                 unsettled_trades = unsettled.scalars().all()
                 for old_trade in unsettled_trades:
-                    entry_price = old_trade.price  # BTC price at entry
-                    # Only settle trades that have a real BTC entry price (> $100)
-                    # Old trades with odds-style prices (0.5) are skipped
+                    entry_price = old_trade.price
                     if entry_price > 100 and current_btc_price > 100:
                         pct_change = (current_btc_price - entry_price) / entry_price
                         if old_trade.side == "SELL":
@@ -390,26 +436,25 @@ class TradingEngine:
                         })
                         logger.info(f"[SETTLED] {old_trade.side} entry=${entry_price:,.2f} exit=${current_btc_price:,.2f} P&L=${pnl:+.2f}")
                     elif entry_price <= 100:
-                        # Old format trade - just mark as settled with $0 P&L
                         old_trade.status = "settled"
                         old_trade.pnl = 0
             except Exception as e:
                 logger.warning(f"P&L settlement error: {e}")
 
-            # 9. EXECUTE NEW PAPER TRADE (guaranteed to happen)
-            market["btc_entry_price"] = current_btc_price
+            # 6. EXECUTE TRADE
+            poly_market["btc_entry_price"] = current_btc_price
             trade_result = await self._execute_trade(
-                db, market,
+                db, poly_market,
                 {**combined_signal, "direction": trade_direction, "confidence": trade_confidence},
                 regime,
             )
             result["trade"] = trade_result
             logger.info(
                 f"[PAPER TRADE] {trade_direction} ${trade_result.get('amount', 0):.2f} "
-                f"BTC@${current_btc_price:,.2f} | {trade_reasons[-1]}"
+                f"BTC@${current_btc_price:,.2f} YES={yes_price:.3f} | {trade_reasons[-1]}"
             )
 
-            # 10. Update bot state and COMMIT
+            # 7. Update bot state and COMMIT
             await self._update_bot_state(db)
             await db.commit()
             logger.info("[PAPER] Cycle complete - trade committed to database")
@@ -418,7 +463,6 @@ class TradingEngine:
             logger.error(f"Paper trading cycle error: {e}", exc_info=True)
             result["status"] = "error"
             result["errors"].append(str(e))
-            # Try to commit whatever we have
             try:
                 await db.commit()
             except Exception:

@@ -82,9 +82,14 @@ function StatsCards({ portfolio, botStatus, sentiment }) {
           />
           <div className={`stat-change ${isRunning ? 'positive' : 'negative'}`}>
             {isRunning
-              ? `Cycle #${botStatus?.cycle_count || 0} | $${botStatus?.min_trade_amount || 2}-$${botStatus?.max_trade_amount || 5}/trade`
+              ? `Cycle #${botStatus?.cycle_count || 0} | Trades at 3:30 mark`
               : 'Bot Stopped'}
           </div>
+          {isRunning && botStatus?.seconds_until_close != null && (
+            <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
+              Window {botStatus.window_start || ''}-{botStatus.window_end || ''} | {botStatus.seconds_until_close}s to close
+            </div>
+          )}
         </div>
       </div>
     </div>

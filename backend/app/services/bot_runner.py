@@ -1,5 +1,11 @@
 """
-Bot Runner - manages the 5-minute trading loop using APScheduler.
+Bot Runner - manages trading aligned to Polymarket 5-minute windows.
+
+Timing:
+- Polymarket BTC 5min markets run on wall-clock 5-min boundaries:
+  :00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55
+- Bot trades at the 3:30 mark of each window (1:30 before close):
+  :03:30, :08:30, :13:30, :18:30, :23:30, :28:30, etc.
 """
 import asyncio
 import logging
@@ -12,6 +18,40 @@ from ..core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Trade at 3 minutes 30 seconds into each 5-minute window
+# This means 1 minute 30 seconds before the window closes
+TRADE_OFFSET_SECONDS = 210  # 3 * 60 + 30 = 210 seconds into the 5-min window
+WINDOW_SECONDS = 300  # 5 minutes
+
+
+def _get_current_window_start() -> datetime:
+    """Get the start of the current 5-minute window (aligned to wall clock)."""
+    now = datetime.utcnow()
+    # Floor to nearest 5-minute boundary
+    minute = now.minute - (now.minute % 5)
+    return now.replace(minute=minute, second=0, microsecond=0)
+
+
+def _get_next_trade_time() -> datetime:
+    """
+    Calculate the next trade execution time.
+    Trade at 3:30 into each 5-min window (1:30 before close).
+    """
+    now = datetime.utcnow()
+    window_start = _get_current_window_start()
+    trade_time = window_start + timedelta(seconds=TRADE_OFFSET_SECONDS)
+
+    if now >= trade_time:
+        # Already past trade time for this window, schedule for next window
+        trade_time += timedelta(seconds=WINDOW_SECONDS)
+
+    return trade_time
+
+
+def _get_window_end() -> datetime:
+    """Get the end of the current 5-minute window."""
+    return _get_current_window_start() + timedelta(seconds=WINDOW_SECONDS)
+
 
 class BotRunner:
     def __init__(self, engine: TradingEngine):
@@ -23,13 +63,25 @@ class BotRunner:
         self.history = []
         self.last_cycle_at = None
         self.next_cycle_at = None
+        self._schedule_task = None
 
     async def _run_cycle(self):
         """Internal cycle runner - never raises, always returns a result."""
         self.cycle_count += 1
         self.last_cycle_at = datetime.utcnow()
-        self.next_cycle_at = self.last_cycle_at + timedelta(seconds=settings.bot_interval_seconds)
-        logger.info(f"=== Trading Cycle #{self.cycle_count} @ {self.last_cycle_at.isoformat()} ===")
+
+        window_start = _get_current_window_start()
+        window_end = _get_window_end()
+        time_left = (window_end - self.last_cycle_at).total_seconds()
+
+        logger.info(
+            f"=== Trading Cycle #{self.cycle_count} @ {self.last_cycle_at.strftime('%H:%M:%S')} | "
+            f"Window {window_start.strftime('%H:%M')}-{window_end.strftime('%H:%M')} | "
+            f"{time_left:.0f}s until close ==="
+        )
+
+        # Schedule next trade time
+        self.next_cycle_at = _get_next_trade_time()
 
         try:
             async with async_session() as db:
@@ -70,8 +122,38 @@ class BotRunner:
 
         return self.last_result
 
+    async def _schedule_loop(self):
+        """
+        Main scheduling loop - waits until the 3:30 mark of each 5-min window,
+        then runs a trading cycle. This ensures trades happen at 1:30 before close.
+        """
+        while self.is_running:
+            try:
+                next_trade = _get_next_trade_time()
+                self.next_cycle_at = next_trade
+                now = datetime.utcnow()
+                wait_seconds = max(0, (next_trade - now).total_seconds())
+
+                if wait_seconds > 0:
+                    logger.info(
+                        f"Next trade at {next_trade.strftime('%H:%M:%S')} UTC "
+                        f"({wait_seconds:.0f}s away, 1:30 before window close)"
+                    )
+                    await asyncio.sleep(wait_seconds)
+
+                if not self.is_running:
+                    break
+
+                await self._run_cycle()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Schedule loop error: {e}", exc_info=True)
+                await asyncio.sleep(10)  # Brief pause on error
+
     async def start(self):
-        """Start the bot scheduler and run first cycle immediately."""
+        """Start the bot, synced to Polymarket 5-minute windows."""
         if self.is_running:
             logger.warning("Bot is already running")
             return
@@ -79,54 +161,71 @@ class BotRunner:
         self.is_running = True
         self.engine.is_running = True
 
-        # Run first cycle immediately in background (fire-and-forget safe)
-        async def _safe_first_cycle():
-            try:
-                await self._run_cycle()
-            except Exception as e:
-                logger.error(f"First cycle failed: {e}", exc_info=True)
+        next_trade = _get_next_trade_time()
+        now = datetime.utcnow()
+        wait_seconds = (next_trade - now).total_seconds()
+        window_end = _get_window_end()
+        time_to_close = (window_end - now).total_seconds()
 
-        asyncio.create_task(_safe_first_cycle())
-
-        # Then schedule repeating cycles
-        interval = settings.bot_interval_seconds
-        if not self.scheduler.running:
-            self.scheduler.start()
-
-        self.scheduler.add_job(
-            self._run_cycle,
-            "interval",
-            seconds=interval,
-            id="trading_cycle",
-            replace_existing=True,
-            max_instances=1,
-            misfire_grace_time=60,
+        logger.info(
+            f"Bot started! Synced to Polymarket 5-min windows. "
+            f"Current window closes in {time_to_close:.0f}s. "
+            f"Next trade at {next_trade.strftime('%H:%M:%S')} ({wait_seconds:.0f}s away)"
         )
-        logger.info(f"Bot started - first cycle running now, then every {interval}s")
+
+        # If we're close enough to the trade time (within 30s), run immediately
+        if wait_seconds <= 30:
+            logger.info("Within 30s of trade time - running first cycle now")
+            asyncio.create_task(self._safe_first_then_loop())
+        else:
+            # Start the scheduling loop
+            self._schedule_task = asyncio.create_task(self._schedule_loop())
+
+        self.next_cycle_at = next_trade
+
+    async def _safe_first_then_loop(self):
+        """Run first cycle immediately, then enter the scheduling loop."""
+        try:
+            await self._run_cycle()
+        except Exception as e:
+            logger.error(f"First cycle failed: {e}", exc_info=True)
+        # Continue with normal scheduling
+        if self.is_running:
+            self._schedule_task = asyncio.create_task(self._schedule_loop())
 
     def stop(self):
-        """Stop the bot scheduler."""
+        """Stop the bot."""
         if not self.is_running:
             logger.warning("Bot is not running")
             return
 
-        try:
-            self.scheduler.remove_job("trading_cycle")
-        except Exception:
-            pass
-        if self.scheduler.running:
-            self.scheduler.shutdown(wait=False)
-            self.scheduler = AsyncIOScheduler()
         self.is_running = False
         self.engine.is_running = False
+
+        if self._schedule_task and not self._schedule_task.done():
+            self._schedule_task.cancel()
+            self._schedule_task = None
+
+        try:
+            if self.scheduler.running:
+                self.scheduler.shutdown(wait=False)
+                self.scheduler = AsyncIOScheduler()
+        except Exception:
+            pass
+
         logger.info("Bot stopped")
 
     async def run_once(self) -> dict:
-        """Run a single trading cycle manually."""
+        """Run a single trading cycle manually (ignores timing)."""
         return await self._run_cycle()
 
     def get_status(self) -> dict:
         now = datetime.utcnow()
+        window_start = _get_current_window_start()
+        window_end = _get_window_end()
+        seconds_in_window = (now - window_start).total_seconds()
+        seconds_until_close = max(0, (window_end - now).total_seconds())
+
         seconds_until_next = 0
         if self.next_cycle_at and self.is_running:
             seconds_until_next = max(0, int((self.next_cycle_at - now).total_seconds()))
@@ -135,10 +234,15 @@ class BotRunner:
             "is_running": self.is_running,
             "trading_mode": self.engine.trading_mode,
             "cycle_count": self.cycle_count,
-            "interval_seconds": settings.bot_interval_seconds,
+            "interval_seconds": WINDOW_SECONDS,
             "last_cycle_at": self.last_cycle_at.isoformat() if self.last_cycle_at else None,
             "next_cycle_at": self.next_cycle_at.isoformat() if self.next_cycle_at else None,
             "seconds_until_next": seconds_until_next,
+            "window_start": window_start.strftime("%H:%M:%S"),
+            "window_end": window_end.strftime("%H:%M:%S"),
+            "seconds_in_window": int(seconds_in_window),
+            "seconds_until_close": int(seconds_until_close),
+            "trade_at": "3:30 mark (1:30 before close)",
             "min_trade_amount": settings.min_trade_amount,
             "max_trade_amount": settings.max_trade_amount,
             "last_result": self.last_result,
