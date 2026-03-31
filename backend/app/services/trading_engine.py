@@ -155,9 +155,17 @@ class TradingEngine:
 
     async def _run_paper_cycle(self, db: AsyncSession) -> dict:
         """
-        Paper mode cycle - trades on Polymarket BTC 5min UP/DOWN market.
-        Decisions based on Polymarket odds movement, NOT TradingView.
-        Executes at 3:30 mark (1:30 before 5-min close).
+        Threshold Breakout Sniper strategy on Polymarket BTC 5min UP/DOWN.
+
+        Logic:
+        1. Find BTC 5min market on CLOB /books
+        2. Extract threshold price from market question (e.g. "from 68400")
+        3. Get current BTC price from Binance
+        4. Compare: price_diff = current_price - threshold_price
+        5. If diff >= +100 → BUY YES (UP), if diff <= -100 → BUY NO (DOWN)
+        6. Safety: |diff| must be between 100 and 500, check liquidity + spread
+
+        This runs at the last 60 seconds of each 5-min window.
         """
         cycle_start = datetime.utcnow()
         self.auto_tuner.tick()
@@ -167,8 +175,9 @@ class TradingEngine:
             "status": "completed",
             "trading_mode": "paper",
             "polymarket_market": None,
-            "markets_scanned": 0,
-            "regime": None,
+            "threshold_price": None,
+            "current_btc_price": None,
+            "price_diff": None,
             "signal": None,
             "trade": None,
             "risk": self.risk_manager.get_stats(),
@@ -176,17 +185,39 @@ class TradingEngine:
         }
 
         try:
-            # 1. Find active BTC 5min market on Polymarket
+            # 1. Find BTC 5min market from CLOB /books (real-time, not Gamma)
             poly_market = None
             try:
                 poly_market = await self.polymarket.get_btc_5min_market()
             except Exception as e:
-                logger.warning(f"Polymarket BTC 5min search failed: {e}")
+                logger.warning(f"CLOB market search failed: {e}")
 
-            # 2. Get BTC spot price (for reference & P&L)
+            if not poly_market:
+                result["status"] = "no_market"
+                result["errors"].append("No BTC 5min UP/DOWN market found on Polymarket CLOB")
+                logger.error("[SNIPER] No BTC 5min market found")
+                return result
+
+            market_id = poly_market.get("id", "")
+            question = poly_market.get("question", "")
+            threshold_price = poly_market.get("threshold_price")
+            result["polymarket_market"] = question
+            result["threshold_price"] = threshold_price
+            self.selected_market = poly_market
+
+            logger.info(f"[SNIPER] Market: {question} | Threshold: ${threshold_price or '?'}")
+
+            # 2. One trade per market - skip if already traded
+            if self.polymarket.already_traded(market_id):
+                result["status"] = "already_traded"
+                result["errors"].append(f"Already traded this market: {question}")
+                logger.info(f"[SNIPER] Skip - already traded {market_id}")
+                return result
+
+            # 3. Get current BTC price from Binance
             current_btc_price = 0
             try:
-                candles = await self.price_feed.get_5m_candles(limit=20) or []
+                candles = await self.price_feed.get_5m_candles(limit=5) or []
                 if candles:
                     current_btc_price = candles[-1]["close"]
             except Exception as e:
@@ -204,239 +235,138 @@ class TradingEngine:
                 result["errors"].append("Could not fetch BTC price")
                 return result
 
-            # 3. Get Polymarket market data for decision making
-            trade_direction = None
+            result["current_btc_price"] = current_btc_price
+
+            # 4. Get orderbook from CLOB for liquidity/spread check
+            poly_data = {}
+            yes_price = poly_market.get("yes_price", 0.5)
+            no_price = poly_market.get("no_price", 0.5)
+
+            if poly_market.get("yes_token"):
+                try:
+                    poly_data = await self.polymarket.get_market_orderbook_analysis(
+                        poly_market["yes_token"],
+                        poly_market.get("no_token", ""),
+                    )
+                    yes_price = poly_data.get("yes_price", 0.5)
+                    no_price = poly_data.get("no_price", 0.5)
+                except Exception as e:
+                    logger.warning(f"Orderbook fetch failed: {e}")
+
+            spread = poly_data.get("spread", 0)
+            has_liquidity = poly_data.get("has_liquidity", False)
+            buy_pressure = poly_data.get("buy_pressure", 0.5)
+
+            # 5. CORE DECISION: Compare BTC price vs threshold
+            trade_direction = None  # "YES" (UP) or "NO" (DOWN)
             trade_confidence = 0
             trade_reasons = []
-            yes_price = 0.50
-            no_price = 0.50
-            poly_data = {}
+            price_diff = 0
 
-            if poly_market and poly_market.get("yes_token"):
-                # Use REAL Polymarket data
-                result["polymarket_market"] = poly_market["question"]
-
-                try:
-                    poly_data = await self.polymarket.get_market_prices_realtime(
-                        poly_market["yes_token"]
-                    )
-                    yes_price = poly_data.get("yes_price", 0.50)
-                    no_price = poly_data.get("no_price", 0.50)
-                    poly_market["yes_price"] = yes_price
-                    poly_market["no_price"] = no_price
-                except Exception as e:
-                    logger.warning(f"Polymarket price fetch failed: {e}")
-
-                # Get price history to see trend
-                price_history = []
-                try:
-                    price_history = await self.polymarket.get_price_history(
-                        poly_market["yes_token"], fidelity=1
-                    )
-                except Exception as e:
-                    logger.warning(f"Polymarket history fetch failed: {e}")
+            if threshold_price and threshold_price > 0:
+                price_diff = current_btc_price - threshold_price
+                result["price_diff"] = round(price_diff, 2)
+                abs_diff = abs(price_diff)
 
                 logger.info(
-                    f"[POLY] Market: {poly_market['question']} | "
-                    f"YES={yes_price:.3f} NO={no_price:.3f} | "
-                    f"History points: {len(price_history)}"
+                    f"[SNIPER] BTC=${current_btc_price:,.2f} | Threshold=${threshold_price:,.2f} | "
+                    f"Diff={price_diff:+.2f} | YES={yes_price:.3f} Spread={spread:.4f}"
                 )
 
-                # --- Decision based on Polymarket data ---
-
-                buy_pressure = poly_data.get("buy_pressure", 0.5)
-                spread = poly_data.get("spread", 0)
-                bid_vol = poly_data.get("bid_volume", 0)
-                ask_vol = poly_data.get("ask_volume", 0)
-
-                # Signal 1: YES price level (market consensus)
-                if yes_price > 0.60:
-                    trade_direction = "BUY"
-                    trade_confidence = 0.3 + (yes_price - 0.50) * 1.5
+                # Valid range: between $100 and $500
+                if abs_diff >= 100 and abs_diff <= 500:
+                    if price_diff >= 100:
+                        trade_direction = "YES"
+                        trade_confidence = min(0.4 + (abs_diff - 100) / 800, 0.9)
+                        trade_reasons.append(
+                            f"[BREAKOUT] BTC ${current_btc_price:,.0f} is +${price_diff:,.0f} above "
+                            f"threshold ${threshold_price:,.0f} → BUY YES (UP)"
+                        )
+                    elif price_diff <= -100:
+                        trade_direction = "NO"
+                        trade_confidence = min(0.4 + (abs_diff - 100) / 800, 0.9)
+                        trade_reasons.append(
+                            f"[BREAKOUT] BTC ${current_btc_price:,.0f} is -${abs_diff:,.0f} below "
+                            f"threshold ${threshold_price:,.0f} → BUY NO (DOWN)"
+                        )
+                elif abs_diff < 100:
+                    result["status"] = "no_breakout"
                     trade_reasons.append(
-                        f"[POLY] Market bullish YES={yes_price:.3f} (>{0.60}) → BUY"
+                        f"[SKIP] Diff ${price_diff:+,.0f} too small (need ±$100). "
+                        f"BTC=${current_btc_price:,.0f} vs threshold=${threshold_price:,.0f}"
                     )
-                elif yes_price < 0.40:
-                    trade_direction = "SELL"
-                    trade_confidence = 0.3 + (0.50 - yes_price) * 1.5
-                    trade_reasons.append(
-                        f"[POLY] Market bearish YES={yes_price:.3f} (<{0.40}) → SELL"
-                    )
-
-                # Signal 2: Order book pressure
-                if not trade_direction and buy_pressure != 0.5:
-                    if buy_pressure > 0.60:
-                        trade_direction = "BUY"
-                        trade_confidence = 0.25 + (buy_pressure - 0.50) * 1.2
-                        trade_reasons.append(
-                            f"[BOOK] Buy pressure {buy_pressure:.0%} (bids={bid_vol:.0f} asks={ask_vol:.0f}) → BUY"
-                        )
-                    elif buy_pressure < 0.40:
-                        trade_direction = "SELL"
-                        trade_confidence = 0.25 + (0.50 - buy_pressure) * 1.2
-                        trade_reasons.append(
-                            f"[BOOK] Sell pressure {buy_pressure:.0%} (bids={bid_vol:.0f} asks={ask_vol:.0f}) → SELL"
-                        )
-
-                # Signal 3: Price history trend (if we have enough data)
-                if not trade_direction and len(price_history) >= 3:
-                    recent_prices = [float(p.get("p", p.get("price", 0.5))) for p in price_history[-5:]]
-                    if len(recent_prices) >= 2:
-                        price_trend = recent_prices[-1] - recent_prices[0]
-                        if price_trend > 0.02:
-                            trade_direction = "BUY"
-                            trade_confidence = min(0.3 + abs(price_trend) * 5, 0.8)
-                            trade_reasons.append(
-                                f"[TREND] YES price rising {recent_prices[0]:.3f}→{recent_prices[-1]:.3f} → BUY"
-                            )
-                        elif price_trend < -0.02:
-                            trade_direction = "SELL"
-                            trade_confidence = min(0.3 + abs(price_trend) * 5, 0.8)
-                            trade_reasons.append(
-                                f"[TREND] YES price falling {recent_prices[0]:.3f}→{recent_prices[-1]:.3f} → SELL"
-                            )
-
-                # Signal 4: Tight spread + lean = high confidence follow
-                if not trade_direction and spread < 0.05 and yes_price != 0.50:
-                    if yes_price > 0.52:
-                        trade_direction = "BUY"
-                        trade_confidence = 0.25
-                        trade_reasons.append(
-                            f"[SPREAD] Tight spread={spread:.3f}, YES leaning up {yes_price:.3f} → BUY"
-                        )
-                    elif yes_price < 0.48:
-                        trade_direction = "SELL"
-                        trade_confidence = 0.25
-                        trade_reasons.append(
-                            f"[SPREAD] Tight spread={spread:.3f}, YES leaning down {yes_price:.3f} → SELL"
-                        )
-
-                self.selected_market = poly_market
-
-            else:
-                # No Polymarket market found - use synthetic with BTC spot data
-                logger.warning("[POLY] No BTC 5min market found on Polymarket, using synthetic")
-                poly_market = self._create_synthetic_market(current_btc_price)
-                self.selected_market = poly_market
-                result["polymarket_market"] = "BTC 5min UP/DOWN (synthetic)"
-
-                # Fall back to BTC spot price movement for direction
-                try:
-                    candles = await self.price_feed.get_5m_candles(limit=10) or []
-                    if len(candles) >= 2:
-                        price_5min_ago = candles[-2]["close"]
-                        price_change = current_btc_price - price_5min_ago
-                        pct_change = price_change / price_5min_ago if price_5min_ago > 0 else 0
-
-                        if pct_change > 0.0005:
-                            trade_direction = "BUY"
-                            trade_confidence = min(0.3 + abs(pct_change) * 100, 0.8)
-                            trade_reasons.append(
-                                f"[SPOT] BTC up {pct_change:.3%} in 5min → BUY"
-                            )
-                        elif pct_change < -0.0005:
-                            trade_direction = "SELL"
-                            trade_confidence = min(0.3 + abs(pct_change) * 100, 0.8)
-                            trade_reasons.append(
-                                f"[SPOT] BTC down {pct_change:.3%} in 5min → SELL"
-                            )
-                except Exception as e:
-                    logger.warning(f"Spot fallback error: {e}")
-
-            # 4. Guaranteed fallback: if no signal yet, use YES price vs 0.50
-            if not trade_direction:
-                if yes_price >= 0.50:
-                    trade_direction = "BUY"
+                    logger.info(f"[SNIPER] No breakout: diff=${price_diff:+.0f} (need ±100)")
                 else:
-                    trade_direction = "SELL"
-                trade_confidence = 0.2
-                trade_reasons.append(
-                    f"[FALLBACK] YES={yes_price:.3f} {'≥' if yes_price >= 0.50 else '<'} 0.50 → {trade_direction}"
-                )
+                    result["status"] = "diff_too_large"
+                    trade_reasons.append(
+                        f"[SKIP] Diff ${price_diff:+,.0f} too large (max ±$500) - risky"
+                    )
+                    logger.info(f"[SNIPER] Diff too large: ${price_diff:+.0f}")
+            else:
+                # No threshold found - use orderbook + YES price as fallback
+                logger.warning("[SNIPER] No threshold in market question, using price fallback")
+                if yes_price > 0.60:
+                    trade_direction = "YES"
+                    trade_confidence = 0.3 + (yes_price - 0.50)
+                    trade_reasons.append(f"[ODDS] YES={yes_price:.3f} > 0.60 → BUY YES")
+                elif no_price > 0.60:
+                    trade_direction = "NO"
+                    trade_confidence = 0.3 + (no_price - 0.50)
+                    trade_reasons.append(f"[ODDS] NO={no_price:.3f} > 0.60 → BUY NO")
 
-            trade_confidence = min(trade_confidence, 0.95)
+            # 6. SAFETY FILTERS
+            if trade_direction:
+                # Liquidity check
+                if not has_liquidity and poly_market.get("yes_token"):
+                    trade_reasons.append("[SKIP] No liquidity in orderbook")
+                    logger.warning("[SNIPER] Skipping - no liquidity")
+                    trade_direction = None
 
-            logger.info(
-                f"[PAPER] Decision: {trade_direction} conf={trade_confidence:.3f} | "
-                f"YES={yes_price:.3f} NO={no_price:.3f} | {trade_reasons[-1]}"
-            )
+                # Spread check
+                if trade_direction and spread > 0.05:
+                    trade_reasons.append(f"[SKIP] Spread {spread:.4f} > 0.05 too wide")
+                    logger.warning(f"[SNIPER] Skipping - spread {spread:.4f} too wide")
+                    trade_direction = None
 
             # Build signal for display
             combined_signal = {
-                "direction": trade_direction,
+                "direction": "BUY" if trade_direction == "YES" else "SELL" if trade_direction == "NO" else "HOLD",
+                "action": trade_direction,  # YES or NO or None
                 "confidence": round(trade_confidence, 4),
-                "combined_score": round(yes_price - 0.50, 4),
+                "combined_score": round(price_diff, 2) if price_diff else 0,
                 "strength": round(trade_confidence, 4),
                 "reasons": trade_reasons,
                 "scores": {
+                    "price_diff": round(price_diff, 2) if price_diff else 0,
+                    "threshold": threshold_price,
+                    "btc_price": round(current_btc_price, 2),
                     "polymarket_yes": round(yes_price, 4),
                     "polymarket_no": round(no_price, 4),
-                    "buy_pressure": round(poly_data.get("buy_pressure", 0.5), 4),
-                    "spread": round(poly_data.get("spread", 0), 4),
+                    "buy_pressure": round(buy_pressure, 4),
+                    "spread": round(spread, 4),
                 },
                 "polymarket": {
                     "yes_price": yes_price,
                     "no_price": no_price,
-                    "buy_pressure": poly_data.get("buy_pressure", 0.5),
-                    "market": poly_market.get("question", "BTC 5min") if poly_market else "N/A",
+                    "buy_pressure": buy_pressure,
+                    "market": question,
+                    "threshold": threshold_price,
                 },
             }
             self.last_signal = combined_signal
             result["signal"] = combined_signal
 
-            # Detect regime from spot prices (for reference)
-            spot_prices = []
-            try:
-                candles = await self.price_feed.get_5m_candles(limit=25) or []
-                spot_prices = [c["close"] for c in candles]
-            except Exception:
-                pass
-            regime = detect_regime(spot_prices) if len(spot_prices) >= 20 else {
-                "regime": "RANGE", "momentum": 0, "volatility": 0,
-                "direction": 0, "trend_efficiency": 0,
-            }
-            result["regime"] = regime
-
-            # Get Polymarket sentiment (from same market odds)
-            poly_sentiment = {"score": 0, "bullish": 0, "bearish": 0, "confidence": 0}
-            try:
-                poly_sentiment = await self.sentiment.analyze_btc_sentiment()
-                db.add(SentimentLog(
-                    source="polymarket", keyword="BTC 5min",
-                    score=poly_sentiment.get("score", 0),
-                    tweet_count=poly_sentiment.get("tweet_count", 0),
-                    bullish_count=poly_sentiment.get("bullish", 0),
-                    bearish_count=poly_sentiment.get("bearish", 0),
-                ))
-            except Exception as e:
-                logger.warning(f"Polymarket sentiment error: {e}")
-
-            # Save snapshot
-            sentiment_score = poly_sentiment.get("score", 0)
-            try:
-                db.add(MarketSnapshot(
-                    market_id=poly_market.get("id", "btc_5min"),
-                    yes_price=yes_price,
-                    no_price=no_price,
-                    volume=poly_market.get("volume", 0),
-                    liquidity=poly_market.get("liquidity", 0),
-                    sentiment_score=sentiment_score,
-                    technical_score=yes_price - 0.50,
-                ))
-            except Exception:
-                pass
-
-            # 5. SETTLE PREVIOUS PAPER TRADES
+            # 7. SETTLE PREVIOUS TRADES
+            regime = {"regime": "SNIPER", "momentum": 0, "volatility": 0, "direction": 0}
             try:
                 unsettled = await db.execute(
                     select(Trade).where(Trade.status == "paper_filled")
                 )
-                unsettled_trades = unsettled.scalars().all()
-                for old_trade in unsettled_trades:
+                for old_trade in unsettled.scalars().all():
                     entry_price = old_trade.price
                     if entry_price > 100 and current_btc_price > 100:
                         pct_change = (current_btc_price - entry_price) / entry_price
-                        if old_trade.side == "SELL":
+                        if old_trade.side == "NO":
                             pct_change = -pct_change
                         trade_amt = old_trade.total_cost or old_trade.size or 2.0
                         pnl = round(trade_amt * pct_change * 100, 2)
@@ -444,38 +374,53 @@ class TradingEngine:
                         old_trade.status = "settled"
                         old_trade.notes = (old_trade.notes or "") + f" | Exit: ${current_btc_price:,.2f} P&L: ${pnl:+.2f}"
                         self.paper_engine.balance += pnl
-                        self.risk_manager.update(pnl, {
-                            "momentum": regime.get("momentum", 0),
-                            "volatility": regime.get("volatility", 0),
-                            "regime": regime.get("regime", "UNKNOWN"),
-                        })
-                        logger.info(f"[SETTLED] {old_trade.side} entry=${entry_price:,.2f} exit=${current_btc_price:,.2f} P&L=${pnl:+.2f}")
+                        self.risk_manager.update(pnl, regime)
                     elif entry_price <= 100:
                         old_trade.status = "settled"
                         old_trade.pnl = 0
             except Exception as e:
                 logger.warning(f"P&L settlement error: {e}")
 
-            # 6. EXECUTE TRADE
-            poly_market["btc_entry_price"] = current_btc_price
-            trade_result = await self._execute_trade(
-                db, poly_market,
-                {**combined_signal, "direction": trade_direction, "confidence": trade_confidence},
-                regime,
-            )
-            result["trade"] = trade_result
-            logger.info(
-                f"[PAPER TRADE] {trade_direction} ${trade_result.get('amount', 0):.2f} "
-                f"BTC@${current_btc_price:,.2f} YES={yes_price:.3f} | {trade_reasons[-1]}"
-            )
+            # 8. EXECUTE TRADE (only if we have a direction)
+            if trade_direction:
+                poly_market["btc_entry_price"] = current_btc_price
+                trade_result = await self._execute_trade(
+                    db, poly_market,
+                    {**combined_signal, "direction": trade_direction, "confidence": trade_confidence},
+                    regime,
+                )
+                result["trade"] = trade_result
 
-            # 7. Update bot state and COMMIT
+                # Mark this market as traded
+                self.polymarket.mark_traded(market_id)
+
+                logger.info(
+                    f"[SNIPER TRADE] BUY {trade_direction} ${trade_result.get('amount', 0):.2f} | "
+                    f"BTC=${current_btc_price:,.2f} vs threshold=${threshold_price:,.2f} | "
+                    f"Diff={price_diff:+.0f} | {trade_reasons[-1] if trade_reasons else ''}"
+                )
+            else:
+                logger.info(f"[SNIPER] No trade this cycle. {trade_reasons[-1] if trade_reasons else 'No signal'}")
+
+            # Save snapshot
+            try:
+                db.add(MarketSnapshot(
+                    market_id=market_id or "btc_5min",
+                    yes_price=yes_price,
+                    no_price=no_price,
+                    volume=poly_market.get("volume", 0),
+                    liquidity=poly_market.get("liquidity", 0),
+                    sentiment_score=price_diff or 0,
+                    technical_score=trade_confidence,
+                ))
+            except Exception:
+                pass
+
             await self._update_bot_state(db)
             await db.commit()
-            logger.info("[PAPER] Cycle complete - trade committed to database")
 
         except Exception as e:
-            logger.error(f"Paper trading cycle error: {e}", exc_info=True)
+            logger.error(f"Sniper cycle error: {e}", exc_info=True)
             result["status"] = "error"
             result["errors"].append(str(e))
             try:
@@ -573,14 +518,14 @@ class TradingEngine:
             poly_signal = generate_technical_signal(poly_prices, label="polymarket")
             divergence = analyze_spot_vs_polymarket_divergence(spot_prices, poly_prices)
 
-            # 7. Sentiment
+            # 7. Sentiment from Polymarket odds (not CoinTelegraph)
             sentiment_result = await self.sentiment.analyze_btc_sentiment()
             sent_log = SentimentLog(
-                source="cointelegraph", keyword="BTC",
+                source="polymarket", keyword="BTC",
                 score=sentiment_result["score"],
-                tweet_count=sentiment_result["tweet_count"],
-                bullish_count=sentiment_result["bullish"],
-                bearish_count=sentiment_result["bearish"],
+                tweet_count=sentiment_result.get("tweet_count", 0),
+                bullish_count=sentiment_result.get("bullish", 0),
+                bearish_count=sentiment_result.get("bearish", 0),
             )
             db.add(sent_log)
 
@@ -657,7 +602,7 @@ class TradingEngine:
         return result
 
     async def _execute_trade(self, db: AsyncSession, market: dict, signal: dict, regime: dict) -> dict:
-        direction = signal["direction"]
+        direction = signal["direction"]  # "YES" (UP) or "NO" (DOWN) or legacy "BUY"/"SELL"
         confidence = signal.get("confidence", 0.5)
 
         # Trade amount: scale between min ($2) and max ($5) based on confidence
@@ -669,12 +614,20 @@ class TradingEngine:
         # BTC entry price for P&L tracking
         btc_entry = market.get("btc_entry_price", 0)
 
-        if direction == "BUY":
+        # Determine token_id and price based on YES/NO direction
+        # YES = buy yes_token (UP), NO = buy no_token (DOWN)
+        if direction in ("YES", "BUY"):
             token_id = market.get("yes_token", "")
             price = market.get("yes_price", 0.5)
-        else:
+            trade_label = "BUY YES (UP)"
+        elif direction in ("NO", "SELL"):
             token_id = market.get("no_token") or market.get("yes_token", "")
             price = market.get("no_price", market.get("yes_price", 0.5))
+            trade_label = "BUY NO (DOWN)"
+        else:
+            token_id = market.get("yes_token", "")
+            price = market.get("yes_price", 0.5)
+            trade_label = f"BUY {direction}"
 
         # Size = trade_amount / price (number of contracts/shares)
         limit_price = min(price + 0.01, 0.99) if price > 0 else 0.50
@@ -687,9 +640,10 @@ class TradingEngine:
             )
             status = "paper_filled"
         else:
+            # Live mode: always BUY the selected token (YES or NO token)
             order_result = await self.polymarket.place_order(
                 token_id=token_id,
-                side="BUY" if direction == "BUY" else "SELL",
+                side="BUY",
                 price=limit_price,
                 size=size,
             )
@@ -697,7 +651,7 @@ class TradingEngine:
 
         trade = Trade(
             market_id=market.get("id", ""),
-            market_name=f"BTC 5min {direction}",
+            market_name=f"BTC 5min {trade_label}",
             side=direction,
             token_id=token_id,
             price=btc_entry if btc_entry > 0 else limit_price,
@@ -705,25 +659,25 @@ class TradingEngine:
             total_cost=trade_amount,
             order_id=order_result.get("order_id", ""),
             status=status,
-            strategy=f"regime_{regime.get('regime', 'unknown').lower()}",
+            strategy="threshold_breakout_sniper",
             signal_strength=confidence,
             notes=(
-                f"BTC Entry: ${btc_entry:,.2f} | Amount: ${trade_amount:.2f} | "
-                f"Regime: {regime.get('regime', '?')} | "
-                f"Momentum: {regime.get('momentum', 0):.0f}bp | "
-                f"Score: {signal.get('combined_score', 0):.3f}"
+                f"{trade_label} | BTC: ${btc_entry:,.2f} | Amount: ${trade_amount:.2f} | "
+                f"Diff: {signal.get('combined_score', 0):+.0f} | "
+                f"Conf: {confidence:.2f}"
             ),
         )
         db.add(trade)
 
         logger.info(
-            f"[{self.trading_mode.upper()}] {direction} ${trade_amount:.2f} "
-            f"BTC@${btc_entry:,.2f} (conf={confidence:.2f}, regime={regime.get('regime', '?')})"
+            f"[{self.trading_mode.upper()}] {trade_label} ${trade_amount:.2f} "
+            f"BTC@${btc_entry:,.2f} (conf={confidence:.2f})"
         )
 
         return {
             "mode": self.trading_mode,
             "side": direction,
+            "action": trade_label,
             "btc_price": btc_entry,
             "amount": trade_amount,
             "price": limit_price,
@@ -731,7 +685,7 @@ class TradingEngine:
             "total_cost": trade_amount,
             "order_id": trade.order_id,
             "status": status,
-            "market": f"BTC 5min {direction}",
+            "market": f"BTC 5min {trade_label}",
             "regime": regime.get("regime", "?"),
             "confidence": confidence,
         }

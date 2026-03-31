@@ -4,8 +4,8 @@ Bot Runner - manages trading aligned to Polymarket 5-minute windows.
 Timing:
 - Polymarket BTC 5min markets run on wall-clock 5-min boundaries:
   :00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55
-- Bot trades at the 3:30 mark of each window (1:30 before close):
-  :03:30, :08:30, :13:30, :18:30, :23:30, :28:30, etc.
+- Bot trades at the 4:00 mark of each window (last 60 seconds before close):
+  :04:00, :09:00, :14:00, :19:00, :24:00, :29:00, etc.
 """
 import asyncio
 import logging
@@ -18,9 +18,9 @@ from ..core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Trade at 3 minutes 30 seconds into each 5-minute window
-# This means 1 minute 30 seconds before the window closes
-TRADE_OFFSET_SECONDS = 210  # 3 * 60 + 30 = 210 seconds into the 5-min window
+# Trade at 4 minutes into each 5-minute window
+# This means 60 seconds (last minute) before the window closes
+TRADE_OFFSET_SECONDS = 240  # 4 * 60 = 240 seconds into the 5-min window
 WINDOW_SECONDS = 300  # 5 minutes
 
 
@@ -35,7 +35,7 @@ def _get_current_window_start() -> datetime:
 def _get_next_trade_time() -> datetime:
     """
     Calculate the next trade execution time.
-    Trade at 3:30 into each 5-min window (1:30 before close).
+    Trade at 4:00 into each 5-min window (last 60 seconds before close).
     """
     now = datetime.utcnow()
     window_start = _get_current_window_start()
@@ -124,8 +124,8 @@ class BotRunner:
 
     async def _schedule_loop(self):
         """
-        Main scheduling loop - waits until the 3:30 mark of each 5-min window,
-        then runs a trading cycle. This ensures trades happen at 1:30 before close.
+        Main scheduling loop - waits until the 4:00 mark of each 5-min window,
+        then runs a trading cycle. This ensures trades happen in the last 60 seconds.
         """
         while self.is_running:
             try:
@@ -137,7 +137,7 @@ class BotRunner:
                 if wait_seconds > 0:
                     logger.info(
                         f"Next trade at {next_trade.strftime('%H:%M:%S')} UTC "
-                        f"({wait_seconds:.0f}s away, 1:30 before window close)"
+                        f"({wait_seconds:.0f}s away, last 60s before window close)"
                     )
                     await asyncio.sleep(wait_seconds)
 
@@ -242,7 +242,7 @@ class BotRunner:
             "window_end": window_end.strftime("%H:%M:%S"),
             "seconds_in_window": int(seconds_in_window),
             "seconds_until_close": int(seconds_until_close),
-            "trade_at": "3:30 mark (1:30 before close)",
+            "trade_at": "4:00 mark (last 60 sec before close)",
             "min_trade_amount": settings.min_trade_amount,
             "max_trade_amount": settings.max_trade_amount,
             "last_result": self.last_result,

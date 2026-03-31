@@ -25,8 +25,15 @@ function SignalPanel({ signal }) {
   // Scores - support both old and new formats
   const scores = signal.scores || {};
 
-  const dirColor = direction === 'BUY' ? 'var(--green)' : direction === 'SELL' ? 'var(--red)' : 'var(--yellow)';
-  const dirBg = direction === 'BUY' ? 'var(--green-bg)' : direction === 'SELL' ? 'var(--red-bg)' : 'var(--yellow-bg)';
+  const action = signal.action || null; // YES or NO
+  const priceDiff = scores.price_diff || 0;
+  const threshold = scores.threshold || (signal.polymarket && signal.polymarket.threshold) || null;
+  const btcPrice = scores.btc_price || 0;
+
+  const isUp = direction === 'BUY' || action === 'YES';
+  const isDown = direction === 'SELL' || action === 'NO';
+  const dirColor = isUp ? 'var(--green)' : isDown ? 'var(--red)' : 'var(--yellow)';
+  const dirBg = isUp ? 'var(--green-bg)' : isDown ? 'var(--red-bg)' : 'var(--yellow-bg)';
 
   return (
     <div className="card">
@@ -49,7 +56,7 @@ function SignalPanel({ signal }) {
         fontFamily: "'JetBrains Mono', monospace",
         marginBottom: '1rem',
       }}>
-        {direction === 'BUY' ? '\u2191 BTC UP' : direction === 'SELL' ? '\u2193 BTC DOWN' : '\u2194 HOLD'}
+        {isUp ? '\u2191 BUY YES (UP)' : isDown ? '\u2193 BUY NO (DOWN)' : '\u2194 HOLD'}
       </div>
 
       {/* Signal Strength & Confidence */}
@@ -70,6 +77,42 @@ function SignalPanel({ signal }) {
           />
         </div>
       </div>
+
+      {/* Threshold Breakout Info */}
+      {(threshold || btcPrice > 0) && (
+        <div style={{
+          padding: '0.75rem',
+          background: 'var(--bg-primary)',
+          borderRadius: '8px',
+          marginBottom: '1rem',
+          border: `1px solid ${priceDiff > 0 ? 'rgba(34,197,94,0.3)' : priceDiff < 0 ? 'rgba(239,68,68,0.3)' : 'rgba(100,116,139,0.3)'}`,
+        }}>
+          <div className="stat-label" style={{ marginBottom: '0.5rem' }}>Threshold Breakout</div>
+          <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap', fontSize: '0.9rem' }}>
+            {btcPrice > 0 && (
+              <div>
+                <span style={{ color: 'var(--text-muted)' }}>BTC: </span>
+                <span className="mono" style={{ fontWeight: 700 }}>${btcPrice.toLocaleString()}</span>
+              </div>
+            )}
+            {threshold && (
+              <div>
+                <span style={{ color: 'var(--text-muted)' }}>Threshold: </span>
+                <span className="mono" style={{ fontWeight: 700 }}>${threshold.toLocaleString()}</span>
+              </div>
+            )}
+            <div>
+              <span style={{ color: 'var(--text-muted)' }}>Diff: </span>
+              <span className="mono" style={{
+                fontWeight: 700,
+                color: priceDiff >= 100 ? 'var(--green)' : priceDiff <= -100 ? 'var(--red)' : 'var(--yellow)',
+              }}>
+                {priceDiff >= 0 ? '+' : ''}{priceDiff.toFixed(0)}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Polymarket Odds */}
       {signal.polymarket && (
