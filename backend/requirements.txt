@@ -11,5 +11,6 @@ numpy==2.2.1
 ta==0.11.0
 pydantic==2.10.4
 pydantic-settings==2.7.1
-py-clob-client==0.34.6
 python-dateutil==2.9.0
+# py-clob-client - only needed for live trading, install manually:
+# pip install py-clob-client

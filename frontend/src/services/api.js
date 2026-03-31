@@ -1,6 +1,7 @@
 import axios from 'axios';
 
-const API_BASE = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+// Use relative URL so nginx proxies API calls (avoids CORS + port issues in Docker)
+const API_BASE = process.env.REACT_APP_API_URL || '';
 
 const api = axios.create({
   baseURL: `${API_BASE}/api`,
@@ -55,6 +56,6 @@ export const updateTradeAmounts = (minAmount, maxAmount) =>
   api.post('/settings/trade-amounts', null, { params: { min_amount: minAmount, max_amount: maxAmount } });
 
 // Health
-export const getHealth = () => axios.get(`${API_BASE}/health`);
+export const getHealth = () => api.get('/health');
 
 export default api;
