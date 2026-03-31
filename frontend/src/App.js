@@ -39,17 +39,21 @@ function App() {
 
   const handleStart = useCallback(async () => {
     setActionLoading(true);
+    showNotification('Starting BTC 5min bot...', 'info');
     try {
       const res = await api.startBot();
       showNotification(res.data?.message || 'Bot started!', 'success');
-      await refetchStatus();
+      // Poll status quickly to update UI
+      setTimeout(() => refetchStatus(), 1000);
+      setTimeout(() => { refetchStatus(); refetchPortfolio(); }, 3000);
+      setTimeout(() => { refetchStatus(); refetchPortfolio(); }, 8000);
     } catch (err) {
       const msg = err.response?.data?.detail || err.message || 'Failed to start bot';
       showNotification(`Error: ${msg}`, 'error');
       console.error('Failed to start bot:', err);
     }
     setActionLoading(false);
-  }, [refetchStatus]);
+  }, [refetchStatus, refetchPortfolio]);
 
   const handleStop = useCallback(async () => {
     setActionLoading(true);
@@ -67,15 +71,17 @@ function App() {
 
   const handleRunOnce = useCallback(async () => {
     setActionLoading(true);
+    showNotification('Running BTC 5min analysis...', 'info');
     try {
       const res = await api.runBotOnce();
       const result = res.data;
-      const status = result?.status || 'done';
       const trade = result?.trade;
       if (trade) {
-        showNotification(`Trade: ${trade.side} ${trade.size}@${trade.price} (${trade.mode})`, 'success');
+        const dir = trade.side === 'BUY' ? 'UP' : 'DOWN';
+        const btcPrice = trade.btc_price ? `BTC $${trade.btc_price.toLocaleString()}` : '';
+        showNotification(`${dir} $${trade.amount?.toFixed(2) || trade.total_cost?.toFixed(2)} ${btcPrice}`, 'success');
       } else {
-        showNotification(`Cycle complete: ${status}`, 'info');
+        showNotification(`Cycle done: ${result?.status || 'no trade'}`, 'info');
       }
       await Promise.all([refetchStatus(), refetchPortfolio()]);
     } catch (err) {
@@ -235,7 +241,7 @@ function App() {
 
         {activeTab === 'markets' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
-            <MarketsList markets={marketsData?.markets || []} />
+            <MarketsList markets={marketsData?.markets || []} botStatus={botStatus} />
           </div>
         )}
 

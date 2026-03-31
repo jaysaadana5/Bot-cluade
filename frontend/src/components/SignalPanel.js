@@ -31,7 +31,8 @@ function SignalPanel({ signal }) {
   return (
     <div className="card">
       <div className="card-header">
-        <span className="card-title">Current Signal</span>
+        <span className="card-title">CURRENT SIGNAL</span>
+        <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>BTC 5min</span>
       </div>
 
       {/* Direction Badge */}
@@ -48,7 +49,7 @@ function SignalPanel({ signal }) {
         fontFamily: "'JetBrains Mono', monospace",
         marginBottom: '1rem',
       }}>
-        {direction === 'BUY' ? '\u2191' : direction === 'SELL' ? '\u2193' : '\u2194'} {direction}
+        {direction === 'BUY' ? '\u2191 BTC UP' : direction === 'SELL' ? '\u2193 BTC DOWN' : '\u2194 HOLD'}
       </div>
 
       {/* Signal Strength & Confidence */}

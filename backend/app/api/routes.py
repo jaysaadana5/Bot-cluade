@@ -30,8 +30,10 @@ def set_dependencies(runner, poly_client, sentiment):
 async def start_bot():
     if bot_runner is None:
         raise HTTPException(500, "Bot not initialized")
+    if bot_runner.is_running:
+        return {"status": "already_running", "message": "Bot is already running", "is_running": True}
     await bot_runner.start()
-    return {"status": "started", "message": "Trading bot started - first cycle running now"}
+    return {"status": "started", "message": "Bot started! First BTC 5min trade running now...", "is_running": True}
 
 
 @router.post("/bot/stop")
@@ -53,18 +55,37 @@ async def bot_status():
 async def run_once():
     if bot_runner is None:
         raise HTTPException(500, "Bot not initialized")
-    result = await bot_runner.run_once()
-    return result
+    try:
+        result = await bot_runner.run_once()
+        return result
+    except Exception as e:
+        return {"status": "error", "errors": [str(e)]}
 
 
 # ── Markets ───────────────────────────────────────────────────────────
 
 @router.get("/markets")
 async def get_markets():
+    """Return the current trading market. In paper mode: BTC 5min UP/DOWN."""
+    if bot_runner and bot_runner.engine.trading_mode == "paper":
+        # Paper mode only trades BTC 5min UP/DOWN
+        market = bot_runner.engine.selected_market
+        if not market:
+            market = {
+                "id": "btc_5min",
+                "question": "BTC 5min UP/DOWN",
+                "description": "5-minute BTC direction signal based on RSI, MACD, momentum",
+                "yes_price": 0.50,
+                "no_price": 0.50,
+                "volume": 0,
+                "liquidity": 0,
+            }
+        return {"markets": [market], "count": 1, "mode": "paper"}
+
     if polymarket_client is None:
         raise HTTPException(500, "Polymarket client not initialized")
     markets = await polymarket_client.get_btc_markets()
-    return {"markets": markets, "count": len(markets)}
+    return {"markets": markets, "count": len(markets), "mode": "live"}
 
 
 @router.get("/markets/{market_id}")
