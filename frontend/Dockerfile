@@ -6,10 +6,14 @@ WORKDIR /app
 ENV REACT_APP_API_URL=
 ENV NODE_OPTIONS=--openssl-legacy-provider
 
-COPY package.json package-lock.json* ./
-RUN npm install --legacy-peer-deps && npm install lodash@4.17.21 --legacy-peer-deps
+COPY package.json ./
+# Clean install: no lock file, force lodash override
+RUN rm -f package-lock.json && npm install --legacy-peer-deps
+# Verify lodash version is correct (4.17.21 has assignWith)
+RUN node -e "const l = require('lodash'); console.log('lodash version:', l.VERSION); if (!l.assignWith) { process.exit(1); }"
 
 COPY . .
+RUN rm -f package-lock.json
 RUN npm run build
 
 # Serve with nginx
