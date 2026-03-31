@@ -4,32 +4,31 @@ import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'rec
 function SentimentPanel({ sentiment, history = [] }) {
   const score = sentiment?.score || 0;
   const markerPos = ((score + 1) / 2) * 100; // -1..1 => 0..100%
+  const details = sentiment?.details || {};
 
   return (
     <div className="card">
       <div className="card-header">
-        <span className="card-title">CoinTelegraph Sentiment</span>
-        {sentiment?.tweet_count > 0 && (
-          <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-            {sentiment.tweet_count} articles analyzed
-          </span>
-        )}
+        <span className="card-title">Polymarket Sentiment</span>
+        <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+          {sentiment?.market || 'BTC 5min UP/DOWN'}
+        </span>
       </div>
 
       {/* Sentiment Meter */}
       <div style={{ marginBottom: '1rem' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.25rem' }}>
-          <span>Bearish</span>
+          <span>Bearish (DOWN)</span>
           <span>Neutral</span>
-          <span>Bullish</span>
+          <span>Bullish (UP)</span>
         </div>
         <div className="sentiment-bar">
           <div className="sentiment-marker" style={{ left: `${markerPos}%` }} />
         </div>
       </div>
 
-      {/* Score Display */}
-      <div style={{ display: 'flex', gap: '1.5rem', marginBottom: '1rem' }}>
+      {/* Polymarket Odds */}
+      <div style={{ display: 'flex', gap: '1.5rem', marginBottom: '1rem', flexWrap: 'wrap' }}>
         <div>
           <div className="stat-label">Score</div>
           <div className={`stat-value ${score > 0 ? 'positive' : score < 0 ? 'negative' : 'neutral'}`}
@@ -37,19 +36,76 @@ function SentimentPanel({ sentiment, history = [] }) {
             {score.toFixed(3)}
           </div>
         </div>
-        <div>
-          <div className="stat-label">Bullish</div>
-          <div className="positive" style={{ fontWeight: 600 }}>{sentiment?.bullish || 0}</div>
-        </div>
-        <div>
-          <div className="stat-label">Bearish</div>
-          <div className="negative" style={{ fontWeight: 600 }}>{sentiment?.bearish || 0}</div>
-        </div>
+        {details.yes_price != null && (
+          <div>
+            <div className="stat-label">YES (UP)</div>
+            <div className="positive" style={{ fontWeight: 700, fontSize: '1.1rem' }}>
+              {(details.yes_price * 100).toFixed(1)}%
+            </div>
+          </div>
+        )}
+        {details.no_price != null && (
+          <div>
+            <div className="stat-label">NO (DOWN)</div>
+            <div className="negative" style={{ fontWeight: 700, fontSize: '1.1rem' }}>
+              {(details.no_price * 100).toFixed(1)}%
+            </div>
+          </div>
+        )}
         <div>
           <div className="stat-label">Confidence</div>
           <div style={{ fontWeight: 600 }}>{((sentiment?.confidence || 0) * 100).toFixed(0)}%</div>
         </div>
       </div>
+
+      {/* Sentiment Breakdown */}
+      {(details.buy_pressure != null || details.spread != null) && (
+        <div style={{
+          padding: '0.75rem',
+          background: 'var(--bg-primary)',
+          borderRadius: '8px',
+          marginBottom: '1rem',
+        }}>
+          <div className="stat-label" style={{ marginBottom: '0.5rem' }}>Market Data</div>
+          <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap', fontSize: '0.85rem' }}>
+            {details.buy_pressure != null && (
+              <div>
+                <span style={{ color: 'var(--text-muted)' }}>Buy Pressure: </span>
+                <span className="mono" style={{
+                  fontWeight: 600,
+                  color: details.buy_pressure > 0.55 ? 'var(--green)' : details.buy_pressure < 0.45 ? 'var(--red)' : 'var(--text-primary)',
+                }}>
+                  {(details.buy_pressure * 100).toFixed(0)}%
+                </span>
+              </div>
+            )}
+            {details.spread != null && details.spread > 0 && (
+              <div>
+                <span style={{ color: 'var(--text-muted)' }}>Spread: </span>
+                <span className="mono" style={{ fontWeight: 600 }}>
+                  {(details.spread * 100).toFixed(2)}%
+                </span>
+              </div>
+            )}
+            {details.bid_volume != null && (
+              <div>
+                <span style={{ color: 'var(--text-muted)' }}>Bids: </span>
+                <span className="mono positive" style={{ fontWeight: 600 }}>
+                  {details.bid_volume.toFixed(0)}
+                </span>
+              </div>
+            )}
+            {details.ask_volume != null && (
+              <div>
+                <span style={{ color: 'var(--text-muted)' }}>Asks: </span>
+                <span className="mono negative" style={{ fontWeight: 600 }}>
+                  {details.ask_volume.toFixed(0)}
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* History Chart */}
       {history.length > 0 && (
@@ -74,25 +130,10 @@ function SentimentPanel({ sentiment, history = [] }) {
         </div>
       )}
 
-      {/* Top Headlines */}
-      {sentiment?.top_tweets?.length > 0 && (
-        <div style={{ marginTop: '1rem' }}>
-          <div className="stat-label" style={{ marginBottom: '0.5rem' }}>Top Headlines</div>
-          {sentiment.top_tweets.slice(0, 3).map((article, i) => (
-            <div key={i} style={{
-              padding: '0.5rem',
-              background: 'var(--bg-primary)',
-              borderRadius: '6px',
-              marginBottom: '0.4rem',
-              fontSize: '0.8rem',
-              color: 'var(--text-secondary)',
-            }}>
-              <span className={article.sentiment === 'bullish' ? 'positive' : article.sentiment === 'bearish' ? 'negative' : ''}>
-                [{article.sentiment}]
-              </span>{' '}
-              {article.text?.substring(0, 120)}{article.text?.length > 120 ? '...' : ''}
-            </div>
-          ))}
+      {/* Source note */}
+      {sentiment?.note && (
+        <div style={{ marginTop: '0.75rem', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+          {sentiment.note}
         </div>
       )}
     </div>

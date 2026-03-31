@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 
 from .polymarket_client import PolymarketClient
-from .cointelegraph_sentiment import CoinTelegraphSentiment
+from .polymarket_sentiment import PolymarketSentiment
 from .btc_price_feed import BTCPriceFeed
 from ..strategies.regime import (
     TradingConfig, detect_regime, RiskManager, AutoTuner, make_regime_decision,
@@ -115,7 +115,7 @@ class PaperTradingEngine:
 
 
 class TradingEngine:
-    def __init__(self, polymarket: PolymarketClient, sentiment: CoinTelegraphSentiment,
+    def __init__(self, polymarket: PolymarketClient, sentiment: PolymarketSentiment,
                  price_feed: BTCPriceFeed = None):
         self.polymarket = polymarket
         self.sentiment = sentiment
@@ -397,7 +397,22 @@ class TradingEngine:
             }
             result["regime"] = regime
 
+            # Get Polymarket sentiment (from same market odds)
+            poly_sentiment = {"score": 0, "bullish": 0, "bearish": 0, "confidence": 0}
+            try:
+                poly_sentiment = await self.sentiment.analyze_btc_sentiment()
+                db.add(SentimentLog(
+                    source="polymarket", keyword="BTC 5min",
+                    score=poly_sentiment.get("score", 0),
+                    tweet_count=poly_sentiment.get("tweet_count", 0),
+                    bullish_count=poly_sentiment.get("bullish", 0),
+                    bearish_count=poly_sentiment.get("bearish", 0),
+                ))
+            except Exception as e:
+                logger.warning(f"Polymarket sentiment error: {e}")
+
             # Save snapshot
+            sentiment_score = poly_sentiment.get("score", 0)
             try:
                 db.add(MarketSnapshot(
                     market_id=poly_market.get("id", "btc_5min"),
@@ -405,7 +420,7 @@ class TradingEngine:
                     no_price=no_price,
                     volume=poly_market.get("volume", 0),
                     liquidity=poly_market.get("liquidity", 0),
-                    sentiment_score=0,
+                    sentiment_score=sentiment_score,
                     technical_score=yes_price - 0.50,
                 ))
             except Exception:
