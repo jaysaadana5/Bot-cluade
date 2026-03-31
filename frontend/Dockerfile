@@ -7,7 +7,7 @@ ENV REACT_APP_API_URL=
 ENV NODE_OPTIONS=--openssl-legacy-provider
 
 COPY package.json package-lock.json* ./
-RUN npm install --legacy-peer-deps
+RUN npm install --legacy-peer-deps && npm install lodash@4.17.21 --legacy-peer-deps
 
 COPY . .
 RUN npm run build
