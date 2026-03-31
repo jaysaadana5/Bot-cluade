@@ -137,14 +137,35 @@ class PolymarketClient:
     # ── Market Discovery (Gamma API - public, no auth needed) ────────
 
     async def get_btc_markets(self) -> list[dict]:
-        """Fetch active BTC-related prediction markets from Gamma API."""
-        btc_markets = []
+        """
+        Fetch active BTC prediction markets from Gamma API.
+        Always includes "BTC 5min UP/DOWN" as the primary trading market.
+        Real Polymarket BTC markets are listed below for reference.
+        """
+        # Always include our BTC 5min market first
+        btc_5min_market = {
+            "id": "btc_5min_signal",
+            "question": "BTC 5min UP/DOWN",
+            "description": "5-minute BTC direction signal. Uses Binance price + TradingView indicators + CoinTelegraph sentiment.",
+            "yes_token": "btc5m_up",
+            "no_token": "btc5m_down",
+            "yes_price": 0.50,
+            "no_price": 0.50,
+            "volume": 0,
+            "liquidity": 0,
+            "end_date": "",
+            "active": True,
+            "closed": False,
+            "is_primary": True,
+        }
+
+        btc_markets = [btc_5min_market]
         btc_keywords = ["btc", "bitcoin", "\u20bf"]
 
+        # Also fetch real Polymarket BTC markets for reference
         search_params = [
             {"tag": "crypto", "active": "true", "closed": "false", "limit": 100},
             {"active": "true", "closed": "false", "limit": 100, "tag": "bitcoin"},
-            {"active": "true", "closed": "false", "limit": 200},
         ]
 
         for params in search_params:
@@ -162,14 +183,14 @@ class PolymarketClient:
                         if not any(existing["id"] == mid for existing in btc_markets):
                             btc_markets.append(self._normalize_market(m))
 
-                if btc_markets:
+                if len(btc_markets) > 1:
                     break
 
             except Exception as e:
                 logger.error(f"Error fetching markets with params {params}: {e}")
                 continue
 
-        logger.info(f"Found {len(btc_markets)} BTC markets total")
+        logger.info(f"Found {len(btc_markets)} BTC markets total (1 primary + {len(btc_markets)-1} Polymarket)")
         return btc_markets
 
     async def get_all_markets(self, limit: int = 100) -> list[dict]:

@@ -66,26 +66,12 @@ async def run_once():
 
 @router.get("/markets")
 async def get_markets():
-    """Return the current trading market. In paper mode: BTC 5min UP/DOWN."""
-    if bot_runner and bot_runner.engine.trading_mode == "paper":
-        # Paper mode only trades BTC 5min UP/DOWN
-        market = bot_runner.engine.selected_market
-        if not market:
-            market = {
-                "id": "btc_5min",
-                "question": "BTC 5min UP/DOWN",
-                "description": "5-minute BTC direction signal based on RSI, MACD, momentum",
-                "yes_price": 0.50,
-                "no_price": 0.50,
-                "volume": 0,
-                "liquidity": 0,
-            }
-        return {"markets": [market], "count": 1, "mode": "paper"}
-
+    """Return BTC markets. BTC 5min UP/DOWN is always the primary market."""
     if polymarket_client is None:
         raise HTTPException(500, "Polymarket client not initialized")
     markets = await polymarket_client.get_btc_markets()
-    return {"markets": markets, "count": len(markets), "mode": "live"}
+    mode = bot_runner.engine.trading_mode if bot_runner else "paper"
+    return {"markets": markets, "count": len(markets), "mode": mode}
 
 
 @router.get("/markets/{market_id}")
