@@ -185,7 +185,10 @@ class TradingEngine:
         }
 
         try:
-            # 1. Find BTC 5min market from CLOB /books (real-time, not Gamma)
+            # 0. Reset traded markets each cycle (new 5-min window = new market)
+            self.polymarket.reset_traded()
+
+            # 1. Find BTC 5min market from CLOB + Gamma (real-time)
             poly_market = None
             try:
                 poly_market = await self.polymarket.get_btc_5min_market()
@@ -193,10 +196,47 @@ class TradingEngine:
                 logger.warning(f"CLOB market search failed: {e}")
 
             if not poly_market:
-                result["status"] = "no_market"
-                result["errors"].append("No BTC 5min UP/DOWN market found on Polymarket CLOB")
-                logger.error("[SNIPER] No BTC 5min market found")
-                return result
+                # In paper mode, create a synthetic market so bot can still trade
+                current_btc = 0
+                try:
+                    candles = await self.price_feed.get_5m_candles(limit=5) or []
+                    if candles:
+                        current_btc = candles[-1]["close"]
+                except Exception:
+                    pass
+                if not current_btc:
+                    try:
+                        tv = await self.price_feed.get_tradingview_analysis(interval="5") or {}
+                        current_btc = tv.get("price", 0)
+                    except Exception:
+                        pass
+
+                if current_btc > 0:
+                    # Round BTC price to nearest $100 as synthetic threshold
+                    synth_threshold = round(current_btc / 100) * 100
+                    poly_market = {
+                        "id": f"btc_5min_synth_{int(synth_threshold)}",
+                        "question": f"Will BTC go Up or Down from ${int(synth_threshold)}?",
+                        "description": "Synthetic BTC 5min market (paper mode)",
+                        "threshold_price": synth_threshold,
+                        "yes_token": f"synth_yes_{int(synth_threshold)}",
+                        "no_token": f"synth_no_{int(synth_threshold)}",
+                        "yes_price": 0.50,
+                        "no_price": 0.50,
+                        "end_time": "",
+                        "volume": 0,
+                        "liquidity": 0,
+                        "active": True,
+                        "closed": False,
+                        "is_primary": True,
+                        "source": "synthetic",
+                    }
+                    logger.info(f"[SNIPER] No real market found - using synthetic: threshold=${synth_threshold}")
+                else:
+                    result["status"] = "no_market"
+                    result["errors"].append("No BTC 5min market found and cannot fetch BTC price")
+                    logger.error("[SNIPER] No market and no BTC price available")
+                    return result
 
             market_id = poly_market.get("id", "")
             question = poly_market.get("question", "")
@@ -315,27 +355,28 @@ class TradingEngine:
                     trade_reasons.append(f"[ODDS] NO={no_price:.3f} > 0.60 → BUY NO")
 
             # 6. SAFETY FILTERS
+            is_synthetic = poly_market.get("source") == "synthetic"
             if trade_direction:
                 # Profitability filter: don't buy if price > 0.90 (only 10¢ profit max)
                 trade_price = yes_price if trade_direction == "YES" else no_price
-                if trade_price > 0.90:
+                if trade_price > 0.90 and not is_synthetic:
                     trade_reasons.append(
                         f"[SKIP] Price {trade_price:.2f} > 0.90 - bad R:R, max profit only {(1-trade_price)*100:.0f}¢"
                     )
                     logger.warning(f"[SNIPER] Skipping - price {trade_price:.2f} > 0.90, bad risk/reward")
                     trade_direction = None
 
-                # Liquidity check
-                if trade_direction and not has_liquidity and poly_market.get("yes_token"):
-                    trade_reasons.append("[SKIP] No liquidity in orderbook")
-                    logger.warning("[SNIPER] Skipping - no liquidity")
-                    trade_direction = None
+                # Liquidity + spread checks only for real markets (not synthetic)
+                if trade_direction and not is_synthetic:
+                    if not has_liquidity and poly_market.get("yes_token", "").startswith("synth") is False:
+                        trade_reasons.append("[SKIP] No liquidity in orderbook")
+                        logger.warning("[SNIPER] Skipping - no liquidity")
+                        trade_direction = None
 
-                # Spread check
-                if trade_direction and spread > 0.05:
-                    trade_reasons.append(f"[SKIP] Spread {spread:.4f} > 0.05 too wide")
-                    logger.warning(f"[SNIPER] Skipping - spread {spread:.4f} too wide")
-                    trade_direction = None
+                    if trade_direction and spread > 0.05:
+                        trade_reasons.append(f"[SKIP] Spread {spread:.4f} > 0.05 too wide")
+                        logger.warning(f"[SNIPER] Skipping - spread {spread:.4f} too wide")
+                        trade_direction = None
 
             # Build signal for display
             combined_signal = {

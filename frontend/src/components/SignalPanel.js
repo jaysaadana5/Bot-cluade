@@ -105,7 +105,7 @@ function SignalPanel({ signal }) {
               <span style={{ color: 'var(--text-muted)' }}>Diff: </span>
               <span className="mono" style={{
                 fontWeight: 700,
-                color: priceDiff >= 100 ? 'var(--green)' : priceDiff <= -100 ? 'var(--red)' : 'var(--yellow)',
+                color: priceDiff >= 30 ? 'var(--green)' : priceDiff <= -30 ? 'var(--red)' : 'var(--yellow)',
               }}>
                 {priceDiff >= 0 ? '+' : ''}{priceDiff.toFixed(0)}
               </span>

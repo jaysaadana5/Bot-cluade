@@ -143,48 +143,66 @@ class PolymarketClient:
     async def close(self):
         await self.client.aclose()
 
-    # ── Market Discovery via CLOB /books (REAL-TIME) ──────────────────
+    # ── Market Discovery ─────────────────────────────────────────────
 
-    async def get_clob_books(self) -> list[dict]:
+    async def get_clob_markets(self) -> list[dict]:
         """
-        Fetch ALL live orderbooks from CLOB /books endpoint.
-        This is the REAL trading layer - not cached like Gamma.
+        Fetch active markets from CLOB /sampling-markets and /markets endpoints.
+        These are the real CLOB discovery endpoints (not /books which doesn't exist).
         """
-        try:
-            resp = await self.client.get(f"{POLYMARKET_CLOB_URL}/books")
-            resp.raise_for_status()
-            books = resp.json()
-            logger.info(f"CLOB /books returned {len(books)} markets")
-            return books
-        except Exception as e:
-            logger.error(f"CLOB /books fetch failed: {e}")
-            return []
+        all_markets = []
+
+        # Try CLOB /sampling-simplified-markets first (featured/active)
+        for endpoint in ["/sampling-simplified-markets", "/sampling-markets"]:
+            try:
+                resp = await self.client.get(
+                    f"{POLYMARKET_CLOB_URL}{endpoint}",
+                    params={"next_cursor": "LQ=="},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                markets = data if isinstance(data, list) else data.get("data", [])
+                if markets:
+                    logger.info(f"CLOB {endpoint} returned {len(markets)} markets")
+                    all_markets.extend(markets)
+                    break
+            except Exception as e:
+                logger.warning(f"CLOB {endpoint} failed: {e}")
+
+        return all_markets
 
     async def get_btc_5min_market(self) -> Optional[dict]:
         """
-        Find the current active BTC 5min UP/DOWN market from CLOB /books.
-        This uses the real-time CLOB API, not the stale Gamma API.
-        Returns the latest matching market with tokens + threshold price.
+        Find the current active BTC 5min UP/DOWN market.
+        Strategy:
+        1. Try CLOB sampling endpoints for real-time data
+        2. Try Gamma API search as fallback
+        3. If no market found at all, return None
         """
-        books = await self.get_clob_books()
-        if not books:
-            logger.warning("CLOB /books returned empty, falling back to Gamma")
-            return await self._get_btc_5min_from_gamma()
+        # Try CLOB first
+        clob_markets = await self.get_clob_markets()
+        result = self._find_btc_5min_in_markets(clob_markets, source="clob")
+        if result:
+            return result
 
+        # Fallback to Gamma API (broader search)
+        logger.info("No BTC 5min market in CLOB, trying Gamma API")
+        return await self._get_btc_5min_from_gamma()
+
+    def _find_btc_5min_in_markets(self, markets: list[dict], source: str = "unknown") -> Optional[dict]:
+        """Search a list of markets for BTC 5min UP/DOWN."""
         btc_5min_markets = []
-        for book in books:
-            question = (book.get("question", "") or "").lower()
-            market_text = question
 
-            is_btc = any(kw in market_text for kw in BTC_KEYWORDS)
-            is_5min = any(kw in market_text for kw in FIVE_MIN_KEYWORDS)
-            is_direction = any(kw in market_text for kw in DIRECTION_KEYWORDS)
+        for book in markets:
+            question = (book.get("question", "") or "").lower()
+
+            is_btc = any(kw in question for kw in BTC_KEYWORDS)
+            is_5min = any(kw in question for kw in FIVE_MIN_KEYWORDS)
+            is_direction = any(kw in question for kw in DIRECTION_KEYWORDS)
 
             if is_btc and (is_5min or is_direction):
-                # Extract threshold price from question (e.g. "from 68400")
                 threshold = self._extract_threshold(book.get("question", ""))
 
-                # Extract tokens
                 tokens = book.get("tokens", [])
                 yes_token = None
                 no_token = None
@@ -213,34 +231,35 @@ class PolymarketClient:
                     "active": book.get("active", True),
                     "closed": book.get("closed", False),
                     "is_primary": True,
-                    "source": "clob",
+                    "source": source,
                 })
                 logger.info(
-                    f"CLOB BTC 5min: {book.get('question', '')} | "
+                    f"{source.upper()} BTC 5min: {book.get('question', '')} | "
                     f"threshold=${threshold or '?'} | end={end_time}"
                 )
 
         if btc_5min_markets:
-            # Pick the latest (most recent end_time)
             btc_5min_markets.sort(key=lambda m: m.get("end_time", ""), reverse=True)
             best = btc_5min_markets[0]
-            logger.info(f"Selected CLOB market: {best['question']} (threshold=${best['threshold_price']})")
+            logger.info(f"Selected {source} market: {best['question']} (threshold=${best['threshold_price']})")
             return best
 
-        logger.warning("No BTC 5min market in CLOB /books, falling back to Gamma")
-        return await self._get_btc_5min_from_gamma()
+        return None
 
     async def _get_btc_5min_from_gamma(self) -> Optional[dict]:
-        """Fallback: search Gamma API if CLOB /books misses."""
+        """Fallback: search Gamma API for BTC 5min markets."""
         search_params = [
             {"tag": "crypto", "active": "true", "closed": "false", "limit": 100},
             {"active": "true", "closed": "false", "limit": 100, "tag": "bitcoin"},
+            {"active": "true", "closed": "false", "limit": 200},  # broad search
         ]
         for params in search_params:
             try:
                 resp = await self.client.get(f"{GAMMA_API_BASE}/markets", params=params)
                 resp.raise_for_status()
                 markets = resp.json()
+
+                # First pass: exact BTC 5min match
                 for m in markets:
                     question = (m.get("question", "") or "").lower()
                     is_btc = any(kw in question for kw in BTC_KEYWORDS)
@@ -250,7 +269,22 @@ class PolymarketClient:
                         normalized["threshold_price"] = self._extract_threshold(m.get("question", ""))
                         normalized["is_primary"] = True
                         normalized["source"] = "gamma"
+                        logger.info(f"Gamma found BTC 5min: {m.get('question', '')}")
                         return normalized
+
+                # Second pass: any BTC up/down market
+                for m in markets:
+                    question = (m.get("question", "") or "").lower()
+                    is_btc = any(kw in question for kw in BTC_KEYWORDS)
+                    is_direction = any(kw in question for kw in DIRECTION_KEYWORDS)
+                    if is_btc and is_direction:
+                        normalized = self._normalize_market(m)
+                        normalized["threshold_price"] = self._extract_threshold(m.get("question", ""))
+                        normalized["is_primary"] = True
+                        normalized["source"] = "gamma"
+                        logger.info(f"Gamma found BTC direction market: {m.get('question', '')}")
+                        return normalized
+
             except Exception as e:
                 logger.error(f"Gamma fallback error: {e}")
         return None
