@@ -162,10 +162,10 @@ class TradingEngine:
         2. Extract threshold price from market question (e.g. "from 68400")
         3. Get current BTC price from Binance
         4. Compare: price_diff = current_price - threshold_price
-        5. If diff >= +100 → BUY YES (UP), if diff <= -100 → BUY NO (DOWN)
-        6. Safety: |diff| must be between 100 and 500, check liquidity + spread
+        5. If diff >= +30 → BUY YES (UP), if diff <= -30 → BUY NO (DOWN)
+        6. Safety: |diff| must be between 30 and 150, price ≤ 0.90, check liquidity + spread
 
-        This runs at the last 60 seconds of each 5-min window.
+        This runs at the last 30 seconds of each 5-min window.
         """
         cycle_start = datetime.utcnow()
         self.auto_tuner.tick()
@@ -273,33 +273,33 @@ class TradingEngine:
                     f"Diff={price_diff:+.2f} | YES={yes_price:.3f} Spread={spread:.4f}"
                 )
 
-                # Valid range: between $100 and $500
-                if abs_diff >= 100 and abs_diff <= 500:
-                    if price_diff >= 100:
+                # Valid range: between $30 and $150
+                if abs_diff >= 30 and abs_diff <= 150:
+                    if price_diff >= 30:
                         trade_direction = "YES"
-                        trade_confidence = min(0.4 + (abs_diff - 100) / 800, 0.9)
+                        trade_confidence = min(0.4 + (abs_diff - 30) / 240, 0.9)
                         trade_reasons.append(
                             f"[BREAKOUT] BTC ${current_btc_price:,.0f} is +${price_diff:,.0f} above "
                             f"threshold ${threshold_price:,.0f} → BUY YES (UP)"
                         )
-                    elif price_diff <= -100:
+                    elif price_diff <= -30:
                         trade_direction = "NO"
-                        trade_confidence = min(0.4 + (abs_diff - 100) / 800, 0.9)
+                        trade_confidence = min(0.4 + (abs_diff - 30) / 240, 0.9)
                         trade_reasons.append(
                             f"[BREAKOUT] BTC ${current_btc_price:,.0f} is -${abs_diff:,.0f} below "
                             f"threshold ${threshold_price:,.0f} → BUY NO (DOWN)"
                         )
-                elif abs_diff < 100:
+                elif abs_diff < 30:
                     result["status"] = "no_breakout"
                     trade_reasons.append(
-                        f"[SKIP] Diff ${price_diff:+,.0f} too small (need ±$100). "
+                        f"[SKIP] Diff ${price_diff:+,.0f} too small (need ±$30). "
                         f"BTC=${current_btc_price:,.0f} vs threshold=${threshold_price:,.0f}"
                     )
-                    logger.info(f"[SNIPER] No breakout: diff=${price_diff:+.0f} (need ±100)")
+                    logger.info(f"[SNIPER] No breakout: diff=${price_diff:+.0f} (need ±30)")
                 else:
                     result["status"] = "diff_too_large"
                     trade_reasons.append(
-                        f"[SKIP] Diff ${price_diff:+,.0f} too large (max ±$500) - risky"
+                        f"[SKIP] Diff ${price_diff:+,.0f} too large (max ±$150) - overextended"
                     )
                     logger.info(f"[SNIPER] Diff too large: ${price_diff:+.0f}")
             else:
@@ -316,8 +316,17 @@ class TradingEngine:
 
             # 6. SAFETY FILTERS
             if trade_direction:
+                # Profitability filter: don't buy if price > 0.90 (only 10¢ profit max)
+                trade_price = yes_price if trade_direction == "YES" else no_price
+                if trade_price > 0.90:
+                    trade_reasons.append(
+                        f"[SKIP] Price {trade_price:.2f} > 0.90 - bad R:R, max profit only {(1-trade_price)*100:.0f}¢"
+                    )
+                    logger.warning(f"[SNIPER] Skipping - price {trade_price:.2f} > 0.90, bad risk/reward")
+                    trade_direction = None
+
                 # Liquidity check
-                if not has_liquidity and poly_market.get("yes_token"):
+                if trade_direction and not has_liquidity and poly_market.get("yes_token"):
                     trade_reasons.append("[SKIP] No liquidity in orderbook")
                     logger.warning("[SNIPER] Skipping - no liquidity")
                     trade_direction = None
