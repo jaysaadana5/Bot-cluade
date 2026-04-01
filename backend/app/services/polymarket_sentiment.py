@@ -50,24 +50,43 @@ class PolymarketSentiment:
         """Fetch Polymarket BTC 5min market and derive sentiment."""
         try:
             market = await self.polymarket.get_btc_5min_market()
-            if not market or not market.get("yes_token"):
+            if not market:
                 return self._neutral_result("No BTC 5min market found on Polymarket")
 
-            # Get real-time prices
-            prices = await self.polymarket.get_market_prices_realtime(
-                market["yes_token"]
-            )
-            yes_price = prices.get("yes_price", 0.50)
-            no_price = prices.get("no_price", 0.50)
-            buy_pressure = prices.get("buy_pressure", 0.5)
-            bid_vol = prices.get("bid_volume", 0)
-            ask_vol = prices.get("ask_volume", 0)
-            spread = prices.get("spread", 0)
+            yes_token = market.get("yes_token", "")
+            no_token = market.get("no_token", "")
+
+            # Get real-time prices from orderbook analysis
+            yes_price = market.get("yes_price", 0.50)
+            no_price = market.get("no_price", 0.50)
+            buy_pressure = 0.5
+            bid_vol = 0
+            ask_vol = 0
+            spread = 0
+
+            if yes_token:
+                try:
+                    prices = await self.polymarket.get_market_orderbook_analysis(
+                        yes_token, no_token
+                    )
+                    yes_price = prices.get("yes_price", yes_price)
+                    no_price = prices.get("no_price", no_price)
+                    buy_pressure = prices.get("buy_pressure", 0.5)
+                    bid_vol = prices.get("bid_volume", 0)
+                    ask_vol = prices.get("ask_volume", 0)
+                    spread = prices.get("spread", 0)
+                except Exception as e:
+                    logger.warning(f"Orderbook analysis failed: {e}")
 
             # Get price history for trend
-            price_history = await self.polymarket.get_price_history(
-                market["yes_token"], fidelity=1
-            )
+            price_history = []
+            if yes_token:
+                try:
+                    price_history = await self.polymarket.get_price_history(
+                        yes_token, fidelity=1
+                    )
+                except Exception as e:
+                    logger.warning(f"Price history fetch failed: {e}")
 
             # Calculate trend from history
             trend_score = 0

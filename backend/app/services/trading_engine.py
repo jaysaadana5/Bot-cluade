@@ -281,17 +281,21 @@ class TradingEngine:
             poly_data = {}
             yes_price = poly_market.get("yes_price", 0.5)
             no_price = poly_market.get("no_price", 0.5)
+            is_synthetic = poly_market.get("source") == "synthetic"
 
-            if poly_market.get("yes_token"):
+            yes_token = poly_market.get("yes_token", "")
+            if yes_token and not is_synthetic:
                 try:
                     poly_data = await self.polymarket.get_market_orderbook_analysis(
-                        poly_market["yes_token"],
+                        yes_token,
                         poly_market.get("no_token", ""),
                     )
                     yes_price = poly_data.get("yes_price", 0.5)
                     no_price = poly_data.get("no_price", 0.5)
                 except Exception as e:
                     logger.warning(f"Orderbook fetch failed: {e}")
+            elif is_synthetic:
+                logger.info("[SNIPER] Synthetic market - skipping orderbook fetch")
 
             spread = poly_data.get("spread", 0)
             has_liquidity = poly_data.get("has_liquidity", False)
